@@ -1052,6 +1052,24 @@ async fn reveal_result(
     .map_err(|_| "Cannot show the saved output.")?
 }
 #[tauri::command]
+async fn open_release_notes(app: tauri::AppHandle) -> Result<(), String> {
+    // Only the installed version's release page can be opened, never a caller-supplied URL.
+    let url = format!("https://github.com/el-jsn/offline-pdf-tools/releases/tag/v{}", app.package_info().version);
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "macos")]
+        let mut command = { let mut command = Command::new("/usr/bin/open"); command.arg(&url); command };
+        #[cfg(target_os = "windows")]
+        let mut command = { let mut command = Command::new("cmd.exe"); command.args(["/C", "start", "", &url]); command };
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let mut command = { let mut command = Command::new("xdg-open"); command.arg(&url); command };
+        let status = command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .status().map_err(|_| "Cannot open release notes in your browser.")?;
+        if !status.success() { return Err("Cannot open release notes in your browser.".into()); }
+        Ok(())
+    }).await.map_err(|_| "Cannot open release notes in your browser.")?
+}
+
+#[tauri::command]
 fn set_view_title(window: tauri::Window, tool: String) -> Result<(), String> {
     let title = match tool.as_str() {
         "merge" => "Merge PDFs",
@@ -1220,6 +1238,7 @@ fn main() {
             process_documents,
             discard_compression_preview,
             reveal_result,
+            open_release_notes,
             set_view_title,
             check_app_update,
             install_app_update,

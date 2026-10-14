@@ -109,20 +109,6 @@ nav {
 .tool.active>.icon {
   color:var(--accent);
 }
-.local-info {
-  margin-top:auto;
-  padding:25px 12px 0;
-  display:flex;
-  align-items:flex-start;
-  gap:9px;
-  color:#63636b;
-  font-size:11px;
-  line-height:1.4;
-}
-.local-info .icon {
-  width:15px;
-  height:15px;
-}
 main {
   min-height:0;
   overflow:hidden;
@@ -698,16 +684,27 @@ dialog h2 {
 
 .sidebar-bottom {
   margin-top:auto;
-  padding-top:16px;
+  padding:16px 12px 0;
 }
-.sidebar-bottom .local-info {
-  margin-top:10px;
-  padding-top:0;
+#app-version {
+  margin:0;
+  color:var(--muted);
+  font-size:11px;
 }
 .sidebar-bottom .text-button {
+  padding:4px 0;
+  justify-content:flex-start;
   text-align:left;
   font-size:12px;
 }
+.app-release-info {
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:4px 12px;
+  margin-bottom:4px;
+}
+.app-release-info .text-button { font-size:11px; }
 
 .compression-size {
   margin:14px 0 0;

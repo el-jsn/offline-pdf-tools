@@ -1,4 +1,5 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
+import { getVersion } from '@tauri-apps/api/app';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { reorderable } from './reorder.js';
 import { icon } from './icons.js';
@@ -39,6 +40,7 @@ function controls() {
   const view = current();
   $('save').disabled = busy || !ready || !validation() || (mode === 'compress' && !view.compressionPreview && !view.measurementFailed); $('clear').disabled = busy;
   $('app-update').disabled = busy;
+  $('release-notes').disabled = busy;
   $('add').disabled = busy || !ready; $('choose').disabled = busy || !ready;
   $('busy-indicator').hidden = !busy; $('loaded').setAttribute('aria-busy', String(busy));
   $('cancel').hidden = !busy || !cancelAvailable; $('reveal').hidden = busy || !view.result;
@@ -422,6 +424,10 @@ $('app-update').addEventListener('click', async () => {
     pendingUpdate = null; $('app-update').textContent = 'Check for updates'; message(String(error), String(error).startsWith('No update') ? '' : 'error');
   } finally { busy = false; controls(); scheduleCompression(); }
 });
+$('release-notes').addEventListener('click', async () => {
+  if (busy) return;
+  try { await invoke('open_release_notes'); } catch (error) { message(String(error), 'error'); }
+});
 $('retry-engine').addEventListener('click', checkEngine);
 $('cancel').addEventListener('click', async () => {
   if (!jobId) return; const cancelledId = jobId; cancelAvailable = false; controls();
@@ -466,4 +472,5 @@ document.addEventListener('keydown', (event) => {
   if (event.key.toLowerCase() === 's') { event.preventDefault(); save(); }
   if (event.key.toLowerCase() === 'z' && mode === 'organize' && !['INPUT', 'TEXTAREA'].includes(event.target.tagName)) { event.preventDefault(); $('undo').click(); }
 });
+getVersion().then((version) => { $('app-version').textContent = `Version ${version}`; $('app-version').hidden = false; }).catch(() => {});
 render(); checkEngine();

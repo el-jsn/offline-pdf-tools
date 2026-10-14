@@ -1,5 +1,5 @@
-import { access } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { access, readFile } from 'node:fs/promises';
+import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { collect } from './collect-release.mjs';
@@ -21,4 +21,10 @@ const code = await new Promise((resolve, reject) => {
   child.once('error', reject); child.once('exit', (code, signal) => resolve(signal ? 1 : code ?? 1));
 });
 if (code !== 0) process.exit(code);
+if (process.platform === 'darwin') {
+  const config = JSON.parse(await readFile(resolve(root, 'src-tauri/tauri.conf.json'), 'utf8'));
+  const app = resolve(root, 'src-tauri/target/release/bundle/macos', `${config.productName}.app`);
+  execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', '--verbose=2', app], { stdio: 'inherit' });
+  console.log('Mac app bundle signature verified.');
+}
 await collect();

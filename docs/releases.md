@@ -40,8 +40,15 @@ set `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if needed. Never commit or upload the k
 Losing or replacing it breaks updates for existing installations.
 
 Update signatures authenticate app updates. They do not replace Apple's Developer
-ID signing/notarization or Windows publisher signing. This checkout has no valid
-Apple signing identity configured, so its DMG can trigger a first-launch block.
+ID signing/notarization or Windows publisher signing. This checkout uses an ad-hoc Mac bundle signature (`signingIdentity: "-"`) and
+checks it with `codesign --verify --deep --strict` before collecting release files.
+It has no Apple Developer ID certificate or notarization, so downloaded builds
+still require approval in macOS Privacy & Security. A valid ad-hoc signature seals
+the bundle; it does not provide Apple-verified developer identity.
+
+For public distribution without that approval step, install a Developer ID
+Application certificate, set `APPLE_SIGNING_IDENTITY` to its identity, and provide
+Tauri notarization credentials. See https://v2.tauri.app/distribute/sign/macos/.
 
 ## Publish an update
 
@@ -82,3 +89,12 @@ restarts the app. There are no background checks or PDF uploads.
 The first published release is necessary before the live update endpoint works.
 The updater has been compiled into the Mac app, but a published version-to-version
 update and a Windows update have not yet been verified.
+
+## Test the 0.1.6 to 0.1.7 update
+
+Keep 0.1.6 installed in Applications. Publish v0.1.7 as the latest release with its
+DMG, update archive, signature, and latest.json. In 0.1.6 choose Check for updates
+and install the offered version. Verify the app restarts displaying Version 0.1.7,
+then choose What’s new to open the v0.1.7 release page. The sidebar no longer shows
+the offline indicator. Do not install the 0.1.7 DMG first, since that skips the
+updater path.
