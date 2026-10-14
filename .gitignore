@@ -1,0 +1,11 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/engine/*
+!src-tauri/engine/README.md
+.DS_Store
+*.pdf
+
+public/pdfjs/
+src-tauri/pdf-tools-engine-*/
+__pycache__/
