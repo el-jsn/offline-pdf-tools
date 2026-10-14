@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod workspace;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -19,7 +20,7 @@ use tauri::{ipc::Channel, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
 const MAX_BYTES: u64 = 250 * 1024 * 1024;
-const MAX_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PREVIEW_CHUNK: u64 = 1024 * 1024;
 const MAX_DOCUMENTS: usize = 100;
 const MAX_PAGES: u32 = 10000;
 const MAX_OUTPUTS: usize = 500;
@@ -30,9 +31,24 @@ struct Selected {
     bytes: u64,
     pages: u32,
     digest: [u8; 32],
+    source_digest: [u8; 32],
+    working: Option<Arc<tempfile::NamedTempFile>>,
+    features: Features,
+    locked: bool,
 }
-#[derive(Default)]
+impl Selected { fn working_path(&self) -> &Path { self.working.as_ref().map_or(self.path.as_path(), |file| file.path()) } }
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Features {
+    forms: bool, signatures: bool, tags: bool, attachments: usize,
+    needs_appearances: bool, unsupported_forms: bool,
+    bookmarks: Vec<Bookmark>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Bookmark { title: String, page: Option<u32>, children: Vec<Bookmark> }
+
 struct Store {
+    workspace: workspace::Workspace,
     documents: Mutex<HashMap<String, Selected>>,
     dropped_paths: Mutex<HashSet<PathBuf>>,
     operation: Mutex<()>,
@@ -41,10 +57,16 @@ struct Store {
     compression_preview: Mutex<Option<Arc<CompressionPreview>>>,
     pending_update: Mutex<Option<(String, tauri_plugin_updater::Update)>>,
 }
+impl Store {
+    fn new() -> Result<Arc<Self>, String> {
+        Ok(Arc::new(Self { workspace: workspace::Workspace::new()?, documents: Mutex::default(), dropped_paths: Mutex::default(), operation: Mutex::default(), job: Mutex::default(), results: Mutex::default(), compression_preview: Mutex::default(), pending_update: Mutex::default() }))
+    }
+}
 struct CompressionPreview {
     id: String,
     ids: Vec<String>,
     compression: Compression,
+    target_bytes: Option<u64>,
     outputs: Vec<tempfile::NamedTempFile>,
     digests: Vec<[u8; 32]>,
     sizes: Vec<u64>,
@@ -53,11 +75,15 @@ struct CompressionPreview {
     _workspace: tempfile::TempDir,
 }
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DocumentInfo {
     id: String,
     name: String,
     bytes: u64,
     pages: u32,
+    preview_bytes: u64,
+    locked: bool,
+    features: Features,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,9 +126,12 @@ enum SplitMode {
     Ranges,
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PageEdit {
     page: u32,
     rotation: u16,
+    #[serde(default)]
+    document_id: String,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -124,6 +153,10 @@ struct Request {
     measure_only: bool,
     #[serde(default)]
     preview_id: Option<String>,
+    #[serde(default)] target_bytes: Option<u64>,
+    #[serde(default)] output_names: Vec<String>,
+    #[serde(default)] flatten_forms: bool,
+    #[serde(default)] acknowledge_changes: bool,
 }
 struct JobLease {
     store: Arc<Store>,
@@ -214,14 +247,14 @@ fn run(command: &mut Command, cancel: Option<&AtomicBool>) -> Result<(i32, Vec<u
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < Duration::from_secs(120) => {
+            Ok(None) if started.elapsed() < Duration::from_secs(600) => {
                 thread::sleep(Duration::from_millis(50))
             }
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader.join();
-                return Err("PDF processing stopped after an engine error or a two-minute time limit. Try a smaller document.".into());
+                return Err("PDF processing stopped after an engine error or a ten-minute time limit. Try a smaller document.".into());
             }
         }
     };
@@ -309,35 +342,52 @@ fn inspect(engine: &Path, path: &Path, cancel: Option<&AtomicBool>) -> Result<Se
     if encrypted != 2 {
         return Err("Encrypted PDFs are not supported. Choose an unencrypted working copy.".into());
     }
-    let output = checked(
-        Command::new(engine)
-            .args(["--json", "--json-key=acroform"])
-            .arg(&path),
-        cancel,
-    )?;
-    let json: serde_json::Value =
-        serde_json::from_slice(&output).map_err(|_| "Cannot inspect PDF form information.")?;
-    let has_form = json
-        .pointer("/acroform/hasacroform")
-        .and_then(|value| value.as_bool())
-        .ok_or("Cannot determine whether this PDF contains forms.")?;
-    let fields = json
-        .pointer("/acroform/fields")
-        .and_then(|value| value.as_array())
-        .ok_or("Cannot inspect PDF fields.")?;
-    if has_form && !fields.is_empty() {
-        return Err("This PDF contains fillable or signature fields. Use a flattened copy; keep the original.".into());
-    }
+    let features = inspect_features(engine, &path, cancel)?;
     let pages = count_pages(engine, &path, cancel)?;
     if pages == 0 || pages > MAX_PAGES {
         return Err("Choose a document with 1 to 10,000 pages.".into());
     }
     Ok(Selected {
         digest: digest(&path, cancel)?,
+        source_digest: digest(&path, cancel)?,
+        working: None, features, locked: false,
         path,
         bytes: metadata.len(),
         pages,
     })
+}
+fn inspect_json(engine: &Path, path: &Path, cancel: Option<&AtomicBool>) -> Result<serde_json::Value, String> {
+    let json_file = tempfile::NamedTempFile::new_in(path.parent().ok_or("Cannot inspect PDF information.")?).map_err(|_| "Cannot inspect PDF information.")?;
+    checked(Command::new(engine).args(["--json", "--json-stream-data=none"]).arg(path).arg(json_file.path()), cancel)?;
+    if json_file.as_file().metadata().map_err(|_| "Cannot inspect PDF information.")?.len() > 64 * 1024 * 1024 { return Err("Document structure is too complex.".into()); }
+    serde_json::from_reader(json_file.as_file()).map_err(|_| "Cannot inspect PDF information.".into())
+}
+fn bookmarks(values: &serde_json::Value) -> Vec<Bookmark> {
+    values.as_array().map(|items| items.iter().map(|item| Bookmark {
+        title: item["title"].as_str().unwrap_or("").to_owned(),
+        page: item["destpageposfrom1"].as_u64().and_then(|n| u32::try_from(n).ok()),
+        children: bookmarks(&item["kids"]),
+    }).collect()).unwrap_or_default()
+}
+fn inspect_features(engine: &Path, path: &Path, cancel: Option<&AtomicBool>) -> Result<Features, String> {
+    let json = inspect_json(engine, path, cancel)?;
+    let objects = json.pointer("/qpdf/1").and_then(|v| v.as_object()).ok_or("Cannot inspect document structure.")?;
+    let root = objects.get("trailer").and_then(|v| v.pointer("/value/~1Root")).and_then(|v| v.as_str()).ok_or("Cannot inspect document catalog.")?;
+    let catalog = objects.get(&format!("obj:{root}")).and_then(|v|v.get("value")).ok_or("Cannot inspect document catalog.")?;
+    let fields = json.pointer("/acroform/fields").and_then(|v| v.as_array()).ok_or("Cannot inspect forms.")?;
+    let signatures = fields.iter().any(|field| field["fieldtype"] == "/Sig") || catalog.get("/Perms").is_some();
+    Ok(Features {
+        forms: !fields.is_empty(), signatures, tags: catalog.get("/StructTreeRoot").is_some(),
+        attachments: json["attachments"].as_object().map_or(0, |items| items.len()),
+        needs_appearances: json.pointer("/acroform/needappearances").and_then(|v| v.as_bool()).unwrap_or(false),
+        unsupported_forms: catalog.pointer("/~1AcroForm/~1XFA").is_some() || objects.values().any(|obj| obj.pointer("/value/~1XFA").is_some()),
+        bookmarks: bookmarks(&json["outlines"]),
+    })
+}
+fn document_info(id: String, document: &Selected) -> DocumentInfo {
+    DocumentInfo { id, name: name(&document.path), bytes: document.bytes, pages: document.pages,
+        preview_bytes: document.working.as_ref().and_then(|file| file.as_file().metadata().ok()).map_or(document.bytes, |m| m.len()),
+        locked: document.locked, features: document.features.clone() }
 }
 fn copy_into(source: &Path, destination: &File, cancel: Option<&AtomicBool>) -> Result<(), String> {
     let mut input = File::open(source).map_err(|_| "Cannot read an input document.")?;
@@ -466,6 +516,30 @@ fn range_argument(pages: &[u32]) -> String {
     }
     chunks.join(",")
 }
+// Only private snapshots reach this function. Repair compressed streams once,
+// then require a clean check and the original page count before using the copy.
+fn repair_snapshot_if_needed(
+    engine: &Path, snapshot: &Path, expected: usize, cancel: &AtomicBool,
+) -> Result<bool, String> {
+    let (code, _) = run(Command::new(engine).arg("--check").arg(snapshot), Some(cancel))?;
+    if code == 0 { return Ok(false); }
+    if code != 3 { return Err("This PDF contains damaged data and could not be repaired. No output was saved.".into()); }
+    let candidate = tempfile::Builder::new().suffix(".pdf")
+        .tempfile_in(snapshot.parent().ok_or("Working folder unavailable.")?)
+        .map_err(|_| "Cannot create a repair copy.")?;
+    let (repair_code, _) = run(
+        Command::new(engine).args(["--recompress-flate", "--compress-streams=y", "--object-streams=generate"])
+            .arg(snapshot).arg(candidate.path()), Some(cancel),
+    )?;
+    if ![0, 3].contains(&repair_code) { return Err("This PDF could not be repaired. No output was saved.".into()); }
+    validate_output(engine, candidate.path(), expected, cancel)
+        .map_err(|error| if error.starts_with("Cancelled") { error } else { "This PDF could not be repaired safely. No output was saved.".into() })?;
+    let destination = File::options().read(true).write(true).open(snapshot)
+        .map_err(|_| "Cannot update the working copy.")?;
+    copy_into(candidate.path(), &destination, Some(cancel))?;
+    Ok(true)
+}
+
 fn validate_output(
     engine: &Path,
     output: &Path,
@@ -510,6 +584,7 @@ fn optimize_images(
     workspace: &Path,
     compression: Compression,
     pages: usize,
+    tuning: Option<(u8, u32)>,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     let (worker, library) = image_runtime(engine)?;
@@ -532,6 +607,7 @@ fn optimize_images(
     let config = directory.path().join("operation.json");
     let operation = serde_json::json!({
         "library": library, "document": output.path(), "index": index, "patch": patch,
+        "quality": tuning.map(|t| t.0), "dpi": tuning.map(|t| t.1),
         "directory": directory.path(), "preset": if compression == Compression::Balanced { "balanced" } else { "small" },
     });
     fs::write(
@@ -577,6 +653,64 @@ fn optimize_images(
         copy_into(candidate.path(), output.as_file(), Some(cancel))?;
     }
     Ok(())
+}
+
+fn preserve_navigation(engine: &Path, output: &tempfile::NamedTempFile, documents: &[Selected], layout: &[(usize,u32,u16)], workspace: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    let json = inspect_json(engine, output.path(), Some(cancel))?;
+    let original = json.pointer("/qpdf/1").and_then(|v| v.as_object()).ok_or("Cannot check document navigation.")?;
+    let root_ref = original["trailer"].pointer("/value/~1Root").and_then(|v| v.as_str()).ok_or("Cannot check document catalog.")?;
+    let root_key = format!("obj:{root_ref}");
+    let mut root = original[&root_key]["value"].clone();
+    let identity = documents.len() == 1 && layout.len() == documents[0].pages as usize && layout.iter().enumerate().all(|(i,(d,p,_))| *d == 0 && *p == i as u32+1);
+    let mut changes = serde_json::Map::new();
+    if !identity {
+        if let Some(root) = root.as_object_mut() { root.remove("/StructTreeRoot"); root.remove("/MarkInfo"); root.remove("/Metadata"); root.remove("/Dests"); }
+        // Named destinations from a partial primary document can target discarded pages.
+        if let Some(names_ref) = root.get("/Names").and_then(|v| v.as_str()) {
+            let key = format!("obj:{names_ref}");
+            if let Some(mut names) = original.get(&key).cloned() { if let Some(dict) = names["value"].as_object_mut() { dict.remove("/Dests"); changes.insert(key, names); } }
+        }
+        for page in json["pages"].as_array().ok_or("Cannot inspect output pages.")? {
+            let key = format!("obj:{}",page["object"].as_str().ok_or("Invalid output page.")?);
+            if let Some(mut obj) = original.get(&key).cloned() { if let Some(dict) = obj["value"].as_object_mut() { dict.remove("/StructParents"); changes.insert(key, obj); } }
+        }
+    }
+    let page_refs: Vec<String> = json["pages"].as_array().ok_or("Cannot inspect output pages.")?.iter().map(|page| page["object"].as_str().unwrap_or("").to_string()).collect();
+    #[derive(Clone)] struct Outline { title: String, destination: Option<String>, children: Vec<Outline> }
+    fn map_bookmarks(items: &[Bookmark], document: usize, layout: &[(usize,u32,u16)], refs: &[String]) -> Vec<Outline> {
+        items.iter().filter_map(|item| {
+            let destination = item.page.and_then(|page| layout.iter().position(|(d,p,_)| *d == document && *p == page)).map(|i| refs[i].clone());
+            let children = map_bookmarks(&item.children,document,layout,refs);
+            if destination.is_none() && children.is_empty() { None } else { Some(Outline { title:item.title.clone(),destination,children }) }
+        }).collect()
+    }
+    let outlines: Vec<_> = documents.iter().enumerate().flat_map(|(i,doc)| map_bookmarks(&doc.features.bookmarks,i,layout,&page_refs)).collect();
+    let mut next = json.pointer("/qpdf/0/maxobjectid").and_then(|v|v.as_u64()).ok_or("Cannot inspect output objects.")? + 1;
+    let outline_root = format!("{} 0 R",next); next+=1;
+    fn emit(items: &[Outline], parent: &str, next: &mut u64, changes: &mut serde_json::Map<String,serde_json::Value>) -> Option<(String,String,usize)> {
+        if items.is_empty() { return None; }
+        let ids: Vec<_> = items.iter().map(|_| { let id=format!("{} 0 R",*next); *next+=1; id }).collect();
+        let mut count=items.len();
+        for (i,item) in items.iter().enumerate() {
+            let mut obj=serde_json::json!({"/Title":format!("u:{}",item.title),"/Parent":parent});
+            if i>0 { obj["/Prev"]=ids[i-1].clone().into(); } if i+1<ids.len() {obj["/Next"]=ids[i+1].clone().into();}
+            if let Some(dest)=&item.destination { obj["/Dest"]=serde_json::json!([dest,"/Fit"]); }
+            if let Some((first,last,children))=emit(&item.children,&ids[i],next,changes) { obj["/First"]=first.into(); obj["/Last"]=last.into(); obj["/Count"]=children.into(); count+=children; }
+            changes.insert(format!("obj:{}",ids[i]),serde_json::json!({"value":obj}));
+        }
+        Some((ids[0].clone(),ids.last().unwrap().clone(),count))
+    }
+    if let Some((first,last,count))=emit(&outlines,&outline_root,&mut next,&mut changes) {
+        changes.insert(format!("obj:{outline_root}"),serde_json::json!({"value":{"/Type":"/Outlines","/First":first,"/Last":last,"/Count":count}})); root["/Outlines"]=outline_root.into();
+    } else if let Some(root)=root.as_object_mut() { root.remove("/Outlines"); }
+    changes.insert(root_key,serde_json::json!({"value":root}));
+    let patch=workspace.join("navigation.json");
+    fs::write(&patch,serde_json::to_vec(&serde_json::json!({"qpdf":[{"jsonversion":2},changes]})).map_err(|_| "Cannot preserve navigation.")?).map_err(|_| "Cannot preserve navigation.")?;
+    let candidate=tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace).map_err(|_| "Cannot preserve navigation.")?;
+    let mut argument=std::ffi::OsString::from("--update-from-json="); argument.push(patch);
+    checked(Command::new(engine).arg(argument).arg(output.path()).arg(candidate.path()),Some(cancel))?;
+    validate_output(engine,candidate.path(),layout.len(),cancel)?;
+    copy_into(candidate.path(),output.as_file(),Some(cancel))
 }
 
 fn record_result(
@@ -632,10 +766,29 @@ fn select_paths(
     if paths.len() > MAX_DOCUMENTS {
         return Err("Choose at most 100 documents at once.".into());
     }
-    let selected = paths
-        .iter()
-        .map(|path| inspect(&engine, path, None))
-        .collect::<Result<Vec<_>, _>>()?;
+    let selected = paths.iter().map(|path| {
+        let path = fs::canonicalize(path).map_err(|_| "Cannot access this PDF.")?;
+        let file = tempfile::Builder::new().suffix(".pdf").tempfile_in(store.workspace.path()).map_err(|_| "Cannot create a working copy.")?;
+        copy_into(&path, file.as_file(), None)?;
+        let source_digest = digest(file.path(), None)?;
+        let (encrypted, _) = run(Command::new(engine).arg("--is-encrypted").arg(file.path()), None)?;
+        if encrypted == 0 {
+            let (requires_password, _) = run(Command::new(engine).arg("--requires-password").arg(file.path()), None)?;
+            if requires_password != 2 && requires_password != 3 {
+                let bytes = file.as_file().metadata().map_err(|_| "Cannot inspect PDF.")?.len();
+                return Ok(Selected { path, bytes, pages: 0, digest: source_digest, source_digest, working: Some(Arc::new(file)), features: Features::default(), locked: true });
+            }
+            let readable = tempfile::Builder::new().suffix(".pdf").tempfile_in(store.workspace.path()).map_err(|_| "Cannot open PDF.")?;
+            checked(Command::new(engine).arg("--decrypt").arg(file.path()).arg(readable.path()), None)?;
+            let mut document = inspect(engine, readable.path(), None)?;
+            document.path = path; document.bytes = file.as_file().metadata().map_err(|_| "Cannot inspect PDF.")?.len();
+            document.source_digest = source_digest; document.working = Some(Arc::new(readable));
+            return Ok(document);
+        }
+        let mut document = inspect(engine, file.path(), None)?;
+        document.path = path; document.working = Some(Arc::new(file));
+        Ok(document)
+    }).collect::<Result<Vec<_>, String>>()?;
     let mut stored = store
         .documents
         .lock()
@@ -664,12 +817,7 @@ fn select_paths(
             .find(|(_, old)| old.path == document.path && old.digest == document.digest)
             .map(|(id, _)| id.clone());
         let id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        result.push(DocumentInfo {
-            id: id.clone(),
-            name: name(&document.path),
-            bytes: document.bytes,
-            pages: document.pages,
-        });
+        result.push(document_info(id.clone(), &document));
         stored.insert(id, document);
     }
     Ok(result)
@@ -761,25 +909,45 @@ fn retain_documents(state: tauri::State<'_, Arc<Store>>, ids: Vec<String>) -> Re
     Ok(())
 }
 #[tauri::command]
-async fn read_document(
-    state: tauri::State<'_, Arc<Store>>,
-    id: String,
-) -> Result<tauri::ipc::Response, String> {
-    let document = state
-        .documents
-        .lock()
-        .map_err(|_| "Document selection is unavailable.")?
-        .get(&id)
-        .cloned()
-        .ok_or("Document is no longer available.")?;
+async fn unlock_document(app: tauri::AppHandle, state: tauri::State<'_, Arc<Store>>, id: String, password: String) -> Result<DocumentInfo, String> {
+    let store = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if document.bytes > MAX_PREVIEW_BYTES { return Err("Previews are limited to documents no larger than 64 MB. PDF processing is still available.".into()); }
-        let mut bytes = Vec::new();
-        File::open(&document.path).map_err(|_| "Cannot read document preview.")?.take(MAX_PREVIEW_BYTES + 1).read_to_end(&mut bytes).map_err(|_| "Cannot read document preview.")?;
-        let fingerprint: [u8; 32] = Sha256::digest(&bytes).into();
-        if bytes.len() as u64 != document.bytes || fingerprint != document.digest { return Err("The document changed. Remove it and add it again.".into()); }
+        let _busy = store.operation.try_lock().map_err(|_| "Another operation is in progress.")?;
+        if password.len() > 1024 || password.contains(['\n', '\r', '\0']) { return Err("Invalid password.".into()); }
+        let document = store.documents.lock().map_err(|_| "Document unavailable.")?.get(&id).cloned().ok_or("Document unavailable.")?;
+        if !document.locked { return Ok(document_info(id, &document)); }
+        let engine = engine(&app)?;
+        let mut secret = tempfile::NamedTempFile::new_in(store.workspace.path()).map_err(|_| "Cannot unlock PDF.")?;
+        secret.write_all(password.as_bytes()).map_err(|_| "Cannot unlock PDF.")?;
+        let output = tempfile::Builder::new().suffix(".pdf").tempfile_in(store.workspace.path()).map_err(|_| "Cannot unlock PDF.")?;
+        let mut argument = std::ffi::OsString::from("--password-file="); argument.push(secret.path());
+        checked(Command::new(&engine).arg(argument).arg("--decrypt").arg(document.working_path()).arg(output.path()), None).map_err(|_| "Incorrect password or unsupported encryption.")?;
+        let mut unlocked = inspect(&engine, output.path(), None)?;
+        unlocked.path = document.path; unlocked.bytes = document.bytes; unlocked.source_digest = document.source_digest;
+        unlocked.working = Some(Arc::new(output));
+        let info = document_info(id.clone(), &unlocked);
+        store.documents.lock().map_err(|_| "Document unavailable.")?.insert(id, unlocked);
+        Ok(info)
+    }).await.map_err(|_| "Cannot unlock PDF.")?
+}
+#[tauri::command]
+async fn read_document_range(state: tauri::State<'_, Arc<Store>>, id: String, begin: u64, end: u64, preview_id: Option<String>, output_index: Option<usize>) -> Result<tauri::ipc::Response, String> {
+    let store = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if end <= begin || end - begin > MAX_PREVIEW_CHUNK { return Err("Invalid preview range.".into()); }
+        let mut file = if let Some(preview_id) = preview_id {
+            let preview = store.compression_preview.lock().map_err(|_| "Preview unavailable.")?.as_ref().filter(|p| p.id == preview_id).cloned().ok_or("Preview expired.")?;
+            preview.outputs.get(output_index.unwrap_or(0)).ok_or("Preview unavailable.")?.reopen().map_err(|_| "Preview unavailable.")?
+        } else {
+            let document = store.documents.lock().map_err(|_| "Document unavailable.")?.get(&id).cloned().ok_or("Document unavailable.")?;
+            if document.locked { return Err("Unlock the PDF first.".into()); }
+            File::open(document.working_path()).map_err(|_| "Preview unavailable.")?
+        };
+        if end > file.metadata().map_err(|_| "Preview unavailable.")?.len() { return Err("Invalid preview range.".into()); }
+        file.seek(SeekFrom::Start(begin)).map_err(|_| "Preview unavailable.")?;
+        let mut bytes = vec![0; (end - begin) as usize]; file.read_exact(&mut bytes).map_err(|_| "Preview unavailable.")?;
         Ok(tauri::ipc::Response::new(bytes))
-    }).await.map_err(|_| "Document preview failed.")?
+    }).await.map_err(|_| "Preview unavailable.")?
 }
 #[tauri::command]
 fn cancel_job(state: tauri::State<'_, Arc<Store>>, job_id: String) -> Result<(), String> {
@@ -824,9 +992,10 @@ async fn process_documents(
             return Err("Only compression supports size measurement.".into());
         }
         match request.operation {
-            Operation::Merge if (2..=MAX_DOCUMENTS).contains(&request.ids.len()) => (),
+            Operation::Merge if (1..=MAX_DOCUMENTS).contains(&request.ids.len()) => (),
             Operation::Compress if (1..=MAX_DOCUMENTS).contains(&request.ids.len()) => (),
-            Operation::Split | Operation::Organize if request.ids.len() == 1 => (),
+            Operation::Split if request.ids.len() == 1 => (),
+            Operation::Organize if (1..=MAX_DOCUMENTS).contains(&request.ids.len()) => (),
             _ => return Err("Merge needs at least two PDFs. Split and Organize need one PDF.".into()),
         }
         if request.ids.iter().collect::<HashSet<_>>().len() != request.ids.len() { return Err("A document was selected twice.".into()); }
@@ -837,13 +1006,22 @@ async fn process_documents(
         if documents.iter().map(|doc| doc.pages as usize).sum::<usize>() > 20000 { return Err("Choose at most 20,000 input pages.".into()); }
         let multiple_outputs = request.operation == Operation::Split || (request.operation == Operation::Compress && documents.len() > 1);
         let plan = if request.operation == Operation::Split { split_plan(&request, documents[0].pages)? } else { Vec::new() };
-        if request.operation == Operation::Organize {
-            if request.pages.is_empty() || request.pages.len() > MAX_PAGES as usize { return Err("Keep between 1 and 10,000 pages.".into()); }
-            let mut included = HashSet::new();
-            for page in &request.pages {
-                if page.page == 0 || page.page > documents[0].pages || ![0, 90, 180, 270].contains(&page.rotation) || !included.insert(page.page) { return Err("Invalid page selection or rotation.".into()); }
-            }
+        if let Some(target) = request.target_bytes {
+            if request.operation != Operation::Compress || !(100_000..=MAX_BYTES).contains(&target) || request.compression == Compression::Lossless { return Err("Choose a target between 0.1 and 250 MB with image compression.".into()); }
         }
+        if matches!(request.operation, Operation::Organize | Operation::Merge) && !request.pages.is_empty() {
+            if request.pages.len() > 20000 { return Err("Choose at most 20,000 output pages.".into()); }
+            for page in &request.pages {
+                let index = request.ids.iter().position(|id| id == &page.document_id).unwrap_or(0);
+                if (!page.document_id.is_empty() && !request.ids.contains(&page.document_id)) || page.page == 0 || page.page > documents[index].pages || ![0, 90, 180, 270].contains(&page.rotation) { return Err("Invalid page selection or rotation.".into()); }
+            }
+        } else if request.operation == Operation::Organize { return Err("Keep at least one page.".into()); }
+        if documents.iter().any(|doc| doc.locked) { return Err("Unlock the PDFs first.".into()); }
+        if documents.iter().any(|doc| doc.features.unsupported_forms) { return Err("XFA forms are unsupported. Use a flattened copy.".into()); }
+        let page_operation = request.operation != Operation::Compress;
+        if page_operation && documents.iter().any(|doc| doc.features.forms) && !request.flatten_forms { return Err("Select Flatten forms before saving.".into()); }
+        if page_operation && documents.iter().any(|doc| doc.features.needs_appearances) { return Err("Save the filled form in its original application before flattening.".into()); }
+        if documents.iter().any(|doc| doc.features.signatures || (page_operation && doc.features.tags)) && !request.acknowledge_changes { return Err("Review document changes before saving.".into()); }
         let engine = engine(&app)?; check_version(&engine)?;
         let suffix = match request.operation { Operation::Merge => "merged", Operation::Compress => "compressed", Operation::Split => "split", Operation::Organize => "organized" };
         let filename = if request.operation == Operation::Merge { "merged.pdf".into() } else { format!("{}-{suffix}.pdf", documents[0].path.file_stem().unwrap_or_default().to_string_lossy()) };
@@ -860,15 +1038,28 @@ async fn process_documents(
         }
         let parent = if request.measure_only || multiple_outputs { destination.as_path() } else { destination.parent().ok_or("Choose a valid output folder.")? };
         // Measurement uses private OS temporary storage; saving uses the destination filesystem.
-        let workspace = tempfile::Builder::new().prefix(".pdf-tools-job-").tempdir_in(parent).map_err(|_| "Cannot write to the selected folder.")?;
+        let workspace = store.workspace.job()?;
         let mut snapshots = Vec::new();
+        let mut recovered_inputs = Vec::new();
         for (index, document) in documents.iter().enumerate() {
             progress(&on_progress, format!("Preparing document {} of {}...", index + 1, documents.len()), true);
             cancelled(Some(&cancel))?;
             let snapshot = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot create a working copy.")?;
-            copy_into(&document.path, snapshot.as_file(), Some(&cancel))?;
+            copy_into(document.working_path(), snapshot.as_file(), Some(&cancel))?;
             let verified = inspect(&engine, snapshot.path(), Some(&cancel))?;
-            if verified.digest != document.digest || verified.pages != document.pages || verified.bytes != document.bytes { return Err("An input document changed. Remove it and add it again.".into()); }
+            if verified.digest != document.digest || verified.pages != document.pages || verified.bytes != fs::metadata(document.working_path()).map_err(|_| "Working copy unavailable.")?.len() { return Err("An input document changed. Remove it and add it again.".into()); }
+            progress(&on_progress, format!("Checking document {} of {}...", index + 1, documents.len()), true);
+            recovered_inputs.push(repair_snapshot_if_needed(&engine, snapshot.path(), document.pages as usize, &cancel)
+                .map_err(|error| if error.starts_with("Cancelled") { error } else { format!("Document {}: {error}", index + 1) })?);
+            if document.features.signatures || (page_operation && document.features.forms) {
+                let prepared = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot prepare forms.")?;
+                let mut command = Command::new(&engine);
+                if document.features.signatures { command.arg("--remove-restrictions"); }
+                if page_operation && document.features.forms { command.arg("--flatten-annotations=all").arg("--remove-acroform"); }
+                checked(command.arg(snapshot.path()).arg(prepared.path()), Some(&cancel))?;
+                validate_output(&engine, prepared.path(), document.pages as usize, &cancel)?;
+                copy_into(prepared.path(), snapshot.as_file(), Some(&cancel))?;
+            }
             snapshots.push(snapshot);
         }
         let input_bytes = documents.iter().map(|doc| doc.bytes).sum::<u64>();
@@ -876,13 +1067,13 @@ async fn process_documents(
         let cached = if request.operation == Operation::Compress && !request.measure_only {
             if let Some(id) = &request.preview_id {
                 let preview = store.compression_preview.lock().map_err(|_| "Compression preview is unavailable.")?
-                    .as_ref().filter(|preview| &preview.id == id && preview.ids == request.ids && preview.compression == request.compression)
+                    .as_ref().filter(|preview| &preview.id == id && preview.ids == request.ids && preview.compression == request.compression && preview.target_bytes == request.target_bytes)
                     .cloned().ok_or("Compression settings changed. Wait for the new size measurement.")?;
                 Some(preview)
             } else { None }
         } else { None };
         let mut outputs = Vec::new(); let mut output_bytes = 0u64; let mut sizes = Vec::new();
-        let mut recovered = cached.as_ref().is_some_and(|preview| preview.recovered);
+        let mut recovered = recovered_inputs.iter().any(|repaired| *repaired) || cached.as_ref().is_some_and(|preview| preview.recovered);
         for index in 0..jobs {
             progress(&on_progress, if jobs == 1 { "Processing the PDF locally...".into() } else { format!("Creating PDF {} of {jobs}...", index + 1) }, true);
             let output = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot create temporary output.")?;
@@ -900,13 +1091,16 @@ async fn process_documents(
             // QPDFJob JSON avoids Windows command-length limits for large page plans.
             let mut job = serde_json::json!({ "outputFile": path_text(output.path())? });
             let expected = match request.operation {
-                Operation::Merge => {
-                    job["empty"] = "".into();
-                    let pages = snapshots.iter().map(|snapshot| {
-                        Ok(serde_json::json!({ "file": path_text(snapshot.path())?, "range": "1-z" }))
-                    }).collect::<Result<Vec<_>, String>>()?;
-                    job["pages"] = pages.into();
-                    documents.iter().map(|doc| doc.pages as usize).sum()
+                Operation::Merge | Operation::Organize => {
+                    job["inputFile"] = path_text(snapshots[0].path())?.into();
+                    let edits: Vec<(usize, u32, u16)> = if request.pages.is_empty() {
+                        documents.iter().enumerate().flat_map(|(i, doc)| (1..=doc.pages).map(move |p| (i,p,0))).collect()
+                    } else { request.pages.iter().map(|p| (request.ids.iter().position(|id| id == &p.document_id).unwrap_or(0), p.page, p.rotation)).collect() };
+                    job["pages"] = edits.iter().map(|(i,p,_)| Ok(serde_json::json!({ "file": path_text(snapshots[*i].path())?, "range": p.to_string() }))).collect::<Result<Vec<_>, String>>()?.into();
+                    let rotations: Vec<String> = [90,180,270].iter().filter_map(|r| { let positions: Vec<u32> = edits.iter().enumerate().filter(|(_,(_,_,rotation))| rotation == r).map(|(i,_)| i as u32+1).collect(); if positions.is_empty() { None } else { Some(format!("+{r}:{}",range_argument(&positions))) } }).collect();
+                    if !rotations.is_empty() { job["rotate"] = serde_json::json!(rotations); }
+                    if documents.len() > 1 { job["copyAttachmentsFrom"] = snapshots.iter().enumerate().skip(1).map(|(i,file)| Ok(serde_json::json!({"file": path_text(file.path())?, "prefix": format!("document-{}-",i+1)}))).collect::<Result<Vec<_>, String>>()?.into(); }
+                    edits.len()
                 }
                 Operation::Compress => {
                     job["inputFile"] = path_text(snapshots[index].path())?.into();
@@ -917,21 +1111,9 @@ async fn process_documents(
                     documents[index].pages as usize
                 }
                 Operation::Split => {
-                    job["empty"] = "".into();
+                    job["inputFile"] = path_text(snapshots[0].path())?.into();
                     job["pages"] = serde_json::json!([{ "file": path_text(snapshots[0].path())?, "range": range_argument(&plan[index]) }]);
                     plan[index].len()
-                }
-                Operation::Organize => {
-                    job["empty"] = "".into();
-                    let mut rotations = Vec::new();
-                    for rotation in [90, 180, 270] {
-                        let positions: Vec<u32> = request.pages.iter().enumerate().filter(|(_, page)| page.rotation == rotation).map(|(position, _)| position as u32 + 1).collect();
-                        if !positions.is_empty() { rotations.push(format!("+{rotation}:{}", range_argument(&positions))); }
-                    }
-                    if !rotations.is_empty() { job["rotate"] = serde_json::json!(rotations); }
-                    let pages: Vec<u32> = request.pages.iter().map(|page| page.page).collect();
-                    job["pages"] = serde_json::json!([{ "file": path_text(snapshots[0].path())?, "range": range_argument(&pages) }]);
-                    request.pages.len()
                 }
             };
             let config = tempfile::Builder::new().suffix(".json").tempfile_in(workspace.path()).map_err(|_| "Cannot prepare the PDF operation.")?;
@@ -947,13 +1129,31 @@ async fn process_documents(
             }
             progress(&on_progress, format!("Checking output {} of {jobs}...", index + 1), true);
             let mut size = validate_output(&engine, output.path(), expected, &cancel)?;
-            if request.operation == Operation::Compress && request.compression != Compression::Lossless {
-                progress(&on_progress, format!("Compressing images in PDF {} of {jobs}...", index + 1), true);
-                optimize_images(&engine, &output, workspace.path(), request.compression, expected, &cancel)?;
+            if page_operation {
+                let layout: Vec<(usize,u32,u16)> = if request.operation == Operation::Split { plan[index].iter().map(|p| (0,*p,0)).collect() }
+                    else if request.pages.is_empty() { documents.iter().enumerate().flat_map(|(i,doc)| (1..=doc.pages).map(move |p| (i,p,0))).collect() }
+                    else { request.pages.iter().map(|p| (request.ids.iter().position(|id| id == &p.document_id).unwrap_or(0),p.page,p.rotation)).collect() };
+                preserve_navigation(&engine, &output, &documents, &layout, workspace.path(), &cancel)?;
                 size = validate_output(&engine, output.path(), expected, &cancel)?;
             }
-            if request.operation == Operation::Compress && size >= documents[index].bytes {
-                copy_into(snapshots[index].path(), output.as_file(), Some(&cancel))?; size = documents[index].bytes;
+            if request.operation == Operation::Compress && request.compression != Compression::Lossless {
+                progress(&on_progress, format!("Compressing images in PDF {} of {jobs}...", index + 1), true);
+                if let Some(target) = request.target_bytes {
+                    let baseline = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot prepare compression.")?;
+                    copy_into(output.path(), baseline.as_file(), Some(&cancel))?;
+                    for tuning in [(80,300),(78,240),(75,200),(70,150)] {
+                        if size <= target { break; }
+                        let attempt = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot prepare compression.")?;
+                        copy_into(baseline.path(), attempt.as_file(), Some(&cancel))?;
+                        optimize_images(&engine, &attempt, workspace.path(), request.compression, expected, Some(tuning), &cancel)?;
+                        let attempt_size = validate_output(&engine, attempt.path(), expected, &cancel)?;
+                        if attempt_size < size { copy_into(attempt.path(), output.as_file(), Some(&cancel))?; size = attempt_size; }
+                    }
+                } else { optimize_images(&engine, &output, workspace.path(), request.compression, expected, None, &cancel)?; }
+                size = validate_output(&engine, output.path(), expected, &cancel)?;
+            }
+            if request.operation == Operation::Compress && !documents[index].features.signatures && !recovered_inputs[index] && size >= fs::metadata(snapshots[index].path()).map_err(|_| "Working copy unavailable.")?.len() {
+                copy_into(snapshots[index].path(), output.as_file(), Some(&cancel))?; size = fs::metadata(snapshots[index].path()).map_err(|_| "Working copy unavailable.")?.len();
             } else { recovered |= code == 3; }
             output.as_file().sync_all().map_err(|_| "Cannot finish writing the PDF.")?;
             output_bytes += size; sizes.push(size); outputs.push(output);
@@ -965,7 +1165,7 @@ async fn process_documents(
             cancelled(Some(&cancel))?;
             let measured = Saved { id: id.clone(), name: String::new(), files: jobs, input_bytes, output_bytes, file_bytes: sizes.clone(), recovered };
             *store.compression_preview.lock().map_err(|_| "Compression preview is unavailable.")? = Some(Arc::new(CompressionPreview {
-                id, ids: request.ids, compression: request.compression, outputs, digests, sizes, recovered, _workspace: workspace,
+                id, ids: request.ids, compression: request.compression, target_bytes: request.target_bytes, outputs, digests, sizes, recovered, _workspace: workspace,
             }));
             return Ok(Some(measured));
         }
@@ -978,14 +1178,19 @@ async fn process_documents(
                 let filename = if request.operation == Operation::Compress {
                     let stem: String = documents[index].path.file_stem().unwrap_or_default().to_string_lossy().chars().take(50).collect();
                     format!("{:03}-{stem}-compressed.pdf", index + 1)
-                } else { format!("part-{:03}.pdf", index + 1) };
+                } else { let fallback = format!("part-{:03}",index+1); let label = request.output_names.get(index).map_or(fallback.clone(), |s| workspace::safe_name(s, &fallback)); format!("{:03}-{label}.pdf",index+1) };
                 let path = folder.path().join(filename);
-                output.persist_noclobber(&path).map_err(|_| "Cannot save PDFs. No output folder was retained.")?;
+                let staged = tempfile::Builder::new().suffix(".pdf").tempfile_in(folder.path()).map_err(|_| "Cannot save PDF.")?;
+                copy_into(output.path(), staged.as_file(), None)?;
+                staged.persist_noclobber(&path).map_err(|_| "Cannot save PDFs. No output folder was retained.")?;
             }
             let path = folder.keep();
             Ok(Some(record_result(&store, path, jobs, input_bytes, output_bytes, recovered)?))
         } else {
-            outputs.pop().ok_or("No PDF was produced.")?.persist_noclobber(&destination).map_err(|_| "Cannot save the PDF. Choose a new filename and a writable folder.")?;
+            let output = outputs.pop().ok_or("No PDF was produced.")?;
+            let staged = tempfile::Builder::new().prefix(".pdf-tools-save-").tempfile_in(parent).map_err(|_| "Cannot save PDF.")?;
+            copy_into(output.path(), staged.as_file(), None)?;
+            staged.persist_noclobber(&destination).map_err(|_| "Cannot save the PDF. Choose a new filename and a writable folder.")?;
             Ok(Some(record_result(&store, destination, 1, input_bytes, output_bytes, recovered)?))
         }
     }).await.map_err(|_| "PDF processing failed.")?
@@ -1212,7 +1417,7 @@ async fn install_app_update(
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(Arc::new(Store::default()))
+        .manage(Store::new().expect("Cannot initialize private storage"))
         // Tauri routes the main window's webview drops through WindowEvent.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
@@ -1230,7 +1435,8 @@ fn main() {
             choose_documents,
             import_dropped_documents,
             retain_documents,
-            read_document,
+            read_document_range,
+            unlock_document,
             cancel_job,
             process_documents,
             discard_compression_preview,
@@ -1246,9 +1452,122 @@ fn main() {
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 let state = app.state::<Arc<Store>>();
+                if let Ok(mut docs) = state.documents.lock() { docs.clear(); }
+                state.workspace.cleanup();
                 if let Ok(mut preview) = state.compression_preview.lock() {
                     *preview = None;
                 };
             }
         });
+}
+#[cfg(test)]
+mod stream_repair_tests {
+    use super::*;
+    const CONTENT: &[u8] = b"BT /F1 12 Tf 72 720 Td (Synthetic credit report fixture) Tj ET\n";
+    const DAMAGED: &[u8] = &[120,156,114,10,81,208,119,51,84,48,52,82,8,73,83,48,55,2,34,3,133,144,20,5,141,224,202,188,146,140,212,146,204,100,133,228,162,212,148,204,18,133,162,212,130,252,162,18,133,180,204,138,146,210,162,84,77,133,144,44,5,215,16,46,0,0,0,0,255,255];
+    const VALID: &[u8] = &[120,156,115,10,81,208,119,51,84,48,52,82,8,73,83,48,55,2,34,3,133,144,20,5,141,224,202,188,146,140,212,146,204,100,133,228,162,212,148,204,18,133,162,212,130,252,162,18,133,180,204,138,146,210,162,84,77,133,144,44,5,215,16,46,0,51,230,19,31];
+    fn engine_path() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("engine/qpdf") }
+    fn fixture(stream: &[u8], path: &Path) {
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+            [format!("<< /Length {} /Filter /FlateDecode >>\nstream\n", stream.len()).into_bytes(), stream.to_vec(), b"\nendstream".to_vec()].concat(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec(); let mut offsets = vec![0];
+        for (i, object) in objects.iter().enumerate() { offsets.push(pdf.len()); pdf.extend_from_slice(format!("{} 0 obj\n", i+1).as_bytes()); pdf.extend(object); pdf.extend_from_slice(b"\nendobj\n"); }
+        let start = pdf.len(); pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len()+1).as_bytes());
+        for offset in offsets.iter().skip(1) { pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes()); }
+        pdf.extend_from_slice(format!("trailer\n<< /Root 1 0 R /Size {} >>\nstartxref\n{}\n%%EOF\n", objects.len()+1, start).as_bytes()); fs::write(path,pdf).unwrap();
+    }
+    #[test]
+    fn repairs_unfinished_flate_and_preserves_content() {
+        let directory = tempfile::tempdir().unwrap(); let path = directory.path().join("working.pdf"); fixture(DAMAGED, &path);
+        let engine=engine_path(); let cancel=AtomicBool::new(false);
+        assert_eq!(run(Command::new(&engine).arg("--check").arg(&path),Some(&cancel)).unwrap().0,3);
+        assert!(repair_snapshot_if_needed(&engine,&path,1,&cancel).unwrap());
+        assert_eq!(run(Command::new(&engine).arg("--check").arg(&path),Some(&cancel)).unwrap().0,0);
+        let json: serde_json::Value=serde_json::from_slice(&checked(Command::new(&engine).arg("--json").arg(&path),Some(&cancel)).unwrap()).unwrap();
+        let object=json["pages"][0]["contents"][0].as_str().unwrap().split_whitespace().next().unwrap();
+        let decoded=checked(Command::new(&engine).arg(format!("--show-object={object}")).arg("--filtered-stream-data").arg(&path),Some(&cancel)).unwrap();
+        assert_eq!(decoded,CONTENT);
+    }
+    #[test]
+    fn clean_snapshot_remains_byte_identical() {
+        let directory=tempfile::tempdir().unwrap(); let path=directory.path().join("clean.pdf");fixture(VALID,&path);let before=fs::read(&path).unwrap();
+        assert!(!repair_snapshot_if_needed(&engine_path(),&path,1,&AtomicBool::new(false)).unwrap());assert_eq!(before,fs::read(path).unwrap());
+    }
+    #[test]
+    fn failed_validation_leaves_snapshot_unchanged() {
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("working.pdf");fixture(DAMAGED,&path);let before=fs::read(&path).unwrap();
+        assert!(repair_snapshot_if_needed(&engine_path(),&path,2,&AtomicBool::new(false)).is_err());assert_eq!(before,fs::read(path).unwrap());
+    }
+    #[test]
+    fn cancellation_leaves_snapshot_unchanged() {
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("working.pdf");fixture(DAMAGED,&path);let before=fs::read(&path).unwrap();
+        let result=repair_snapshot_if_needed(&engine_path(),&path,1,&AtomicBool::new(true));assert!(result.unwrap_err().starts_with("Cancelled"));assert_eq!(before,fs::read(path).unwrap());
+    }
+    #[test]
+    fn fatal_stream_damage_is_rejected() {
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("working.pdf");fixture(b"not-a-compressed-stream",&path);let before=fs::read(&path).unwrap();
+        assert!(repair_snapshot_if_needed(&engine_path(),&path,1,&AtomicBool::new(false)).is_err());assert_eq!(before,fs::read(path).unwrap());
+    }
+    #[test]
+    fn repaired_snapshot_works_in_each_pdf_operation() {
+        let directory=tempfile::tempdir().unwrap();let input=directory.path().join("working.pdf");fixture(DAMAGED,&input);let engine=engine_path();let cancel=AtomicBool::new(false);
+        repair_snapshot_if_needed(&engine,&input,1,&cancel).unwrap();
+        let source=input.to_str().unwrap();
+        for (index, (args, pages)) in [
+            (vec!["--empty","--pages",source,"1-z",source,"1","--"],2),
+            (vec!["--empty","--pages",source,"1","--"],1),
+            (vec!["--rotate=+90:1","--empty","--pages",source,"1","--"],1),
+            (vec!["--recompress-flate","--compress-streams=y",source],1),
+        ].iter().enumerate() {
+            let output=directory.path().join(format!("result-{index}.pdf"));checked(Command::new(&engine).args(args).arg(&output),Some(&cancel)).unwrap();validate_output(&engine,&output,*pages,&cancel).unwrap();
+        }
+    }
+    #[test]
+    #[ignore = "Requires an explicitly supplied local PDF; never stores it in the repository"]
+    fn local_document_repair() {
+        let original=PathBuf::from(std::env::var_os("PDF_TOOLS_LOCAL_CHECK").expect("Supply a local PDF path"));
+        let engine=engine_path(); let cancel=AtomicBool::new(false);
+        let before=digest(&original,Some(&cancel)).unwrap(); let pages=count_pages(&engine,&original,Some(&cancel)).unwrap();
+        let directory=tempfile::tempdir().unwrap(); let working=directory.path().join("working.pdf");fs::copy(&original,&working).unwrap();
+        assert!(repair_snapshot_if_needed(&engine,&working,pages as usize,&cancel).unwrap());
+        let output=directory.path().join("merged.pdf");
+        checked(Command::new(&engine).args(["--empty","--pages"]).arg(&working).arg("1-z").arg(&working).args(["1","--"]).arg(&output),Some(&cancel)).unwrap();
+        validate_output(&engine,&output,pages as usize+1,&cancel).unwrap();
+        assert_eq!(before,digest(&original,Some(&cancel)).unwrap());
+    }
+
+    #[test]
+    fn encrypted_pdf_without_open_password_is_readable() {
+        let directory=tempfile::tempdir().unwrap(); let input=directory.path().join("input.pdf"); let encrypted=directory.path().join("encrypted.pdf");fixture(VALID,&input);let engine=engine_path();
+        checked(Command::new(&engine).args(["--encrypt","","synthetic-owner-password","256","--"]).arg(&input).arg(&encrypted),None).unwrap();
+        let store=Store::new().unwrap();let selected=select_paths(&store,&engine,vec![encrypted]).unwrap();
+        assert_eq!(selected.len(),1);assert!(!selected[0].locked);assert_eq!(selected[0].pages,1);
+    }
+    #[test]
+    fn encrypted_pdf_requiring_password_stays_locked() {
+        let directory=tempfile::tempdir().unwrap();let input=directory.path().join("input.pdf");let encrypted=directory.path().join("encrypted.pdf");fixture(VALID,&input);let engine=engine_path();
+        checked(Command::new(&engine).args(["--encrypt","synthetic-open-password","synthetic-owner-password","256","--"]).arg(&input).arg(&encrypted),None).unwrap();
+        let store=Store::new().unwrap();let selected=select_paths(&store,&engine,vec![encrypted]).unwrap();assert!(selected[0].locked);
+    }
+    #[test]
+    fn navigation_remaps_bookmarks_after_page_reordering() {
+        let directory=tempfile::tempdir().unwrap();let input=directory.path().join("input.pdf");fixture(VALID,&input);let engine=engine_path();let cancel=AtomicBool::new(false);
+        let source=directory.path().join("two-pages.pdf");checked(Command::new(&engine).args(["--empty","--pages"]).arg(&input).args(["1,1","--"]).arg(&source),Some(&cancel)).unwrap();
+        let mut document=inspect(&engine,&source,Some(&cancel)).unwrap();document.features.bookmarks=vec![Bookmark {title:"Income".into(),page:Some(1),children:vec![]},Bookmark {title:"Statements".into(),page:Some(2),children:vec![]}];
+        let output=tempfile::Builder::new().suffix(".pdf").tempfile_in(directory.path()).unwrap();
+        checked(Command::new(&engine).args(["--empty","--pages"]).arg(&source).args(["2,1","--"]).arg(output.path()),Some(&cancel)).unwrap();
+        preserve_navigation(&engine,&output,&[document],&[(0,2,0),(0,1,0)],directory.path(),&cancel).unwrap();
+        let result=inspect_features(&engine,output.path(),Some(&cancel)).unwrap();assert_eq!(result.bookmarks.len(),2);assert_eq!(result.bookmarks[0].page,Some(2));assert_eq!(result.bookmarks[1].page,Some(1));
+    }
+    #[test]
+    fn another_instance_does_not_delete_live_working_files() {
+        let first=workspace::Workspace::new().unwrap();let marker=first.path().join("synthetic-marker");fs::write(&marker,b"fixture").unwrap();
+        let second=workspace::Workspace::new().unwrap();assert!(marker.is_file());drop(second);assert!(marker.is_file());
+    }
+
 }

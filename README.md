@@ -8,10 +8,10 @@ Documents are never uploaded.
 - Merge multiple PDFs in the order you choose.
 - Compress individually or in batches: Balanced by default, with lossless and Smallest options.
 - Balanced and Smallest resize and recompress embedded images, including CMYK photographs. Text and vector objects are preserved.
-- See the actual compressed size before saving. Saving uses the measured output.
+- See the actual compressed size before saving and compare the original and compressed pages. Set an optional limit per PDF; an unmet limit is identified. Saving uses the measured output.
 - Preview source PDFs in all four tools with page navigation and zoom. Organize previews follow the current page order and rotations.
-- Organize pages with group dragging, edge scrolling, keyboard selection, quick preview, rotation and removal, undo, and moves to a specific position.
-- Split with thumbnail selection, custom page groups, fixed groups, every page, or page split points. Extract selected pages together or separately, combine custom groups, and preview output page lists.
+- Organize pages with group dragging, edge scrolling, keyboard selection, previews, rotation, duplication, removal, undo/redo, and moves to a specific position.
+- Split with thumbnail selection, named page groups, fixed groups, every page, bookmarks, or page split points. Extract selected pages together or separately, combine custom groups, and preview output page lists.
 - Choose System, Light, or Dark appearance in the sidebar.
 - Add files through drag and drop or the file picker.
 
@@ -59,13 +59,16 @@ existing private update key; it is not committed to this repository. See
 
 - Up to 100 selected PDFs, 250 MB per file, and 10,000 pages per file.
 - Up to 20,000 pages per operation and 500 split outputs.
-- Thumbnail previews support files up to 64 MB; larger files can still be processed.
-- Encrypted PDFs and actual fillable form fields are unsupported. Empty form metadata is accepted.
-- Signed originals should not be processed: signature preservation is not supported.
-- Page operations may discard bookmarks, attachments, metadata, and accessibility tags.
+- Previews support selected files up to 250 MB using local range reads. Complex PDFs can still exceed rendering memory limits.
+- Encrypted PDFs that open without a password are accepted. Other encrypted PDFs require a supplied password; output copies are unencrypted. Ordinary form fields can be preserved during compression or explicitly flattened for page operations. XFA forms and forms requiring regenerated appearances are unsupported for page operations.
+- Digital signatures cannot be preserved through processing. A changed copy requires explicit acknowledgement; originals remain untouched.
+- Page bookmarks are remapped to retained pages. Bookmarks without a resolvable page destination can be omitted. Merging retains attachments with distinct prefixes. Changed page layouts can discard named destinations, XMP metadata, and accessibility tags; accessibility changes require acknowledgement.
 
-Warning-only processing results are accepted only after the output passes a separate
-structure, stream, and page-count check. Recovered data is identified in the status.
+Input PDFs with recoverable compressed-stream warnings are repaired in a temporary
+working copy. The repaired copy must pass strict structure, stream, and page-count
+checks before processing. Unrepairable files are rejected. Warning-only processing
+results are accepted only after the output passes a separate structure, stream, and
+page-count check. Recovered data is identified in the status.
 
 Lossless compression may produce little reduction. Balanced and Smallest resize
 and JPEG-compress eligible images and convert their decoded colors to RGB.
@@ -73,5 +76,4 @@ Transparency masks, one-bit images, ambiguous image dictionaries, and images abo
 32 million pixels are preserved. Other presets can reduce image quality. A file that cannot be made smaller is saved as an unchanged copy.
 
 PDF processing and previews work offline. Update checks and installer downloads
-contact GitHub only when requested. Temporary working files are normally removed
-when finished or cleared; an interrupted app or forced quit can leave them behind.
+contact GitHub only when requested. Private working copies are removed when cleared or closed. Abandoned private workspaces are reclaimed on a later launch; active instances are protected by file locks. A forced quit during the final output publication step can leave a staging file in the selected destination.

@@ -2574,7 +2574,7 @@ dependencies = [
 
 [[package]]
 name = "offline-pdf-tools"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "image",
  "pdfium-render",
