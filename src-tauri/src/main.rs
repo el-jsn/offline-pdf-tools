@@ -487,6 +487,98 @@ fn validate_output(
     }
     Ok(bytes)
 }
+fn image_runtime(engine: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let directory = engine.parent().ok_or("Image engine unavailable.")?;
+    let worker = directory.join(if cfg!(windows) {
+        "pdf-image-worker.exe"
+    } else {
+        "pdf-image-worker"
+    });
+    let library = directory.join(if cfg!(windows) {
+        "pdfium.dll"
+    } else {
+        "libpdfium.dylib"
+    });
+    if !worker.is_file() || !library.is_file() {
+        return Err("The image engine is missing. Install a complete copy of PDF Tools.".into());
+    }
+    Ok((worker, library))
+}
+fn optimize_images(
+    engine: &Path,
+    output: &tempfile::NamedTempFile,
+    workspace: &Path,
+    compression: Compression,
+    pages: usize,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let (worker, library) = image_runtime(engine)?;
+    let directory = tempfile::Builder::new()
+        .prefix("images-")
+        .tempdir_in(workspace)
+        .map_err(|_| "Cannot create an image workspace.")?;
+    let index = directory.path().join("index.json");
+    let mut prefix = std::ffi::OsString::from("--json-stream-prefix=");
+    prefix.push(directory.path().join("stream"));
+    checked(
+        Command::new(engine)
+            .args(["--json-output=2", "--json-stream-data=file"])
+            .arg(prefix)
+            .arg(output.path())
+            .arg(&index),
+        Some(cancel),
+    )?;
+    let patch = directory.path().join("patch.json");
+    let config = directory.path().join("operation.json");
+    let operation = serde_json::json!({
+        "library": library, "document": output.path(), "index": index, "patch": patch,
+        "directory": directory.path(), "preset": if compression == Compression::Balanced { "balanced" } else { "small" },
+    });
+    fs::write(
+        &config,
+        serde_json::to_vec(&operation).map_err(|_| "Cannot prepare image compression.")?,
+    )
+    .map_err(|_| "Cannot prepare image compression.")?;
+    let result = checked(Command::new(worker).arg(config), Some(cancel)).map_err(|error| {
+        if error.starts_with("Cancelled") {
+            error
+        } else {
+            "Image compression could not finish. No output was saved.".into()
+        }
+    })?;
+    let stats: serde_json::Value =
+        serde_json::from_slice(&result).map_err(|_| "Invalid image compression result.")?;
+    let images = stats["images"]
+        .as_u64()
+        .ok_or("Invalid image compression result.")?;
+    if images == 0 {
+        return Ok(());
+    }
+    let candidate = tempfile::Builder::new()
+        .suffix(".pdf")
+        .tempfile_in(directory.path())
+        .map_err(|_| "Cannot create compressed output.")?;
+    let mut update = std::ffi::OsString::from("--update-from-json=");
+    update.push(patch);
+    checked(
+        Command::new(engine)
+            .arg(update)
+            .args(["--object-streams=generate", "--compression-level=9"])
+            .arg(output.path())
+            .arg(candidate.path()),
+        Some(cancel),
+    )?;
+    let size = validate_output(engine, candidate.path(), pages, cancel)?;
+    if size
+        < fs::metadata(output.path())
+            .map_err(|_| "Cannot inspect output size.")?
+            .len()
+    {
+        copy_into(candidate.path(), output.as_file(), Some(cancel))?;
+    }
+    Ok(())
+}
+
 fn record_result(
     store: &Store,
     path: PathBuf,
@@ -518,9 +610,19 @@ fn record_result(
 
 #[tauri::command]
 async fn engine_status(app: tauri::AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || check_version(&engine(&app)?))
-        .await
-        .map_err(|_| "Engine check failed.")?
+    tauri::async_runtime::spawn_blocking(move || {
+        let engine = engine(&app)?;
+        check_version(&engine)?;
+        let (worker, library) = image_runtime(&engine)?;
+        checked(
+            Command::new(worker).arg("--check-runtime").arg(library),
+            None,
+        )
+        .map_err(|_| "The image engine could not start. Install a complete copy of PDF Tools.")?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| "Engine check failed.")?
 }
 fn select_paths(
     store: &Store,
@@ -812,12 +914,6 @@ async fn process_documents(
                     job["recompressFlate"] = "".into();
                     job["compressionLevel"] = "9".into();
                     job["objectStreams"] = "generate".into();
-                    let quality = match request.compression {
-                        Compression::Lossless => None,
-                        Compression::Balanced => Some("80"),
-                        Compression::Small => Some("55"),
-                    };
-                    if let Some(quality) = quality { job["optimizeImages"] = "".into(); job["jpegQuality"] = quality.into(); }
                     documents[index].pages as usize
                 }
                 Operation::Split => {
@@ -851,6 +947,11 @@ async fn process_documents(
             }
             progress(&on_progress, format!("Checking output {} of {jobs}...", index + 1), true);
             let mut size = validate_output(&engine, output.path(), expected, &cancel)?;
+            if request.operation == Operation::Compress && request.compression != Compression::Lossless {
+                progress(&on_progress, format!("Compressing images in PDF {} of {jobs}...", index + 1), true);
+                optimize_images(&engine, &output, workspace.path(), request.compression, expected, &cancel)?;
+                size = validate_output(&engine, output.path(), expected, &cancel)?;
+            }
             if request.operation == Operation::Compress && size >= documents[index].bytes {
                 copy_into(snapshots[index].path(), output.as_file(), Some(&cancel))?; size = documents[index].bytes;
             } else { recovered |= code == 3; }
@@ -1097,9 +1198,10 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Arc::new(Store::default()))
-        .on_webview_event(|webview, event| {
-            if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
-                let state = webview.state::<Arc<Store>>();
+        // Tauri routes the main window's webview drops through WindowEvent.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                let state = window.state::<Arc<Store>>();
                 if let Ok(mut allowed) = state.dropped_paths.lock() {
                     allowed.clear();
                     if paths.len() <= MAX_DOCUMENTS {

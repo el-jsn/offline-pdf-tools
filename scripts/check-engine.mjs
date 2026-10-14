@@ -21,7 +21,11 @@ try {
   const version = execFileSync(executable, ['--version'], { encoding: 'utf8', timeout: 10000, windowsHide: true });
   const match = version.match(/qpdf version (\d+)\.(\d+)/);
   if (!match || Number(match[1]) < 12 || (Number(match[1]) === 12 && Number(match[2]) < 1)) throw new Error('Bundled qpdf must be version 12.1 or newer.');
-  console.log('Bundled PDF engine verified.');
+  const worker = join(directory, process.platform === 'win32' ? 'pdf-image-worker.exe' : 'pdf-image-worker');
+  const pdfium = join(directory, process.platform === 'win32' ? 'pdfium.dll' : 'libpdfium.dylib');
+  if (!manifest.pdfium || !existsSync(worker) || !existsSync(pdfium)) throw new Error('Missing PDFium image runtime or worker.');
+  execFileSync(worker, ['--check-runtime', pdfium], { encoding: 'utf8', timeout: 10000, windowsHide: true });
+  console.log('Bundled PDF and image engines verified.');
 } catch (error) {
   console.error(error.message);
   process.exit(1);

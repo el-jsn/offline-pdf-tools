@@ -1,0 +1,18 @@
+import { spawn } from 'node:child_process';
+import { readFile, writeFile, copyFile, access } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
+const root = fileURLToPath(new URL('../', import.meta.url));
+const engine = resolve(root, 'src-tauri/engine');
+const library = process.platform === 'win32' ? 'pdfium.dll' : 'libpdfium.dylib';
+await access(resolve(engine, library));
+const child = spawn('cargo', ['build', '--release', '--bin', 'pdf-image-worker'], { cwd: resolve(root, 'src-tauri'), stdio: 'inherit' });
+const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code) => resolve(code ?? 1)); });
+if (code !== 0) process.exit(code);
+const name = process.platform === 'win32' ? 'pdf-image-worker.exe' : 'pdf-image-worker';
+await copyFile(resolve(root, 'src-tauri/target/release', name), resolve(engine, name));
+const path = resolve(engine, 'manifest.json'); const manifest = JSON.parse(await readFile(path, 'utf8'));
+manifest.files[name] = createHash('sha256').update(await readFile(resolve(engine, name))).digest('hex');
+await writeFile(path, JSON.stringify(manifest, null, 2) + '\n');
+console.log('Isolated PDFium image worker built.');

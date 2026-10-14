@@ -13,6 +13,19 @@ On Windows, use `py` and the path to `qpdf.exe`. The runtime must match the targ
 architecture. The staging script copies native dependencies; the release build
 checks hashes, version, and runtime loading. Users do not need qpdf or Homebrew.
 
+Stage PDFium for the same architecture, with its complete build notices:
+
+```sh
+python3 scripts/stage-pdfium.py /path/to/libpdfium.dylib --notices /path/to/BUILD_LICENSES --version 156.0.8076.0 --source https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium/8076
+```
+
+On Windows use `pdfium.dll`. The Mac runtime used here is the PDFium 156.0.8076.0
+library and complete license set bundled with pypdfium2 5.14.0. PDFium builds must
+provide the API symbols required by the pinned Rust bindings. PDFium and JPEG
+processing run in a separate executable so cancellation, timeouts, or a native
+engine failure do not terminate the app. The build checks library loading before
+packaging. There are no runtime downloads.
+
 Install dependencies with `npm ci`. Run `npm run release` to build the installer,
 signed update artifact, and `latest.json`. Output is in `releases/<version>/`.
 Build on the native Mac or Windows architecture; the collection script does not

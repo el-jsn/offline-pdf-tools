@@ -6,7 +6,8 @@ Documents are never uploaded.
 ## Features
 
 - Merge multiple PDFs in the order you choose.
-- Compress individually or in batches, with three quality settings.
+- Compress individually or in batches: lossless, Balanced, or Smallest.
+- Balanced and Smallest resize and recompress embedded images, including CMYK photographs. Text and vector objects are preserved.
 - See the actual compressed size before saving. Saving uses the measured output.
 - Split by page, fixed groups, or custom ranges.
 - Preview, reorder, rotate, and remove pages.
@@ -33,8 +34,9 @@ so operating system security warnings may appear.
 ## Build
 
 Requires Node 22.16+, npm, Rust 1.90+, and the [Tauri platform prerequisites](https://v2.tauri.app/start/prerequisites/).
-The bundled PDF engine is qpdf 12.1 or newer. On a fresh checkout, stage its native
-runtime and matching license notices using `scripts/stage-engine.py`.
+The native runtimes are qpdf 12.1+ and PDFium. On a fresh checkout, stage their
+libraries and matching license notices using `scripts/stage-engine.py` and
+`scripts/stage-pdfium.py`. The release build compiles and bundles the image worker.
 
 ```sh
 npm ci
@@ -63,8 +65,10 @@ existing private update key; it is not committed to this repository. See
 Warning-only processing results are accepted only after the output passes a separate
 structure, stream, and page-count check. Recovered data is identified in the status.
 
-Lossless compression may produce little reduction. Other presets can reduce image
-quality. A file that cannot be made smaller is saved as an unchanged copy.
+Lossless compression may produce little reduction. Balanced and Smallest resize
+and JPEG-compress eligible images and convert their decoded colors to RGB.
+Transparency masks, one-bit images, ambiguous image dictionaries, and images above
+32 million pixels are preserved. Other presets can reduce image quality. A file that cannot be made smaller is saved as an unchanged copy.
 
 PDF processing and previews work offline. Update checks and installer downloads
 contact GitHub only when requested. Temporary working files are normally removed
