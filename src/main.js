@@ -2,6 +2,7 @@ import { invoke, Channel } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { reorderable } from './reorder.js';
+import { pagesFromDocuments, insertPages, insertionAtPoint } from './organize-import.js';
 import { icon } from './icons.js';
 import { Previews } from './previews.js';
 import { splitPlan, parseRange, pageList, movePagesTo, movePagesBeside, bookmarkGroups, pageKey } from './model.js';
@@ -26,6 +27,7 @@ const state = Object.fromEntries(Object.keys(tools).map((tool) => [tool, {
 let mode = 'merge'; let busy = false; let ready = false; let jobId = null; let cancelAvailable = false; let lastSelected = null;
 let compressionTimer = null;
 let previewSession = null;
+let previewRenderSequence = 0;
 let pendingUnlock = null;
 let duplicateKey = 0;
 let pendingUpdate = null; let updateChecking = false; let availableUpdateVersion = null;
@@ -36,9 +38,14 @@ const current = () => state[mode];
 const previews = new Previews();
 for (const element of document.querySelectorAll('[data-icon]')) element.replaceWith(icon(element.dataset.icon));
 function message(text, type = '') { $('status').textContent = text; $('status').className = type; }
+function outputDocuments(view) {
+  if (mode !== 'organize') return view.documents;
+  const used = new Set(view.pages.map((page) => page.documentId || view.documents[0]?.id));
+  return view.documents.filter((doc) => used.has(doc.id));
+}
 function changesFor(view) {
   const pageOperation = mode !== 'compress';
-  const docs = view.documents.filter((doc) => !doc.locked);
+  const docs = outputDocuments(view).filter((doc) => !doc.locked);
   const any = (test) => docs.some((doc) => test(doc.features));
   const blocked = any((features) => features.unsupportedForms) ? 'XFA forms are unsupported. Print or export a flattened copy, then add it again.'
     : pageOperation && any((features) => features.needsAppearances) ? 'A filled form must be saved in its original application before it can be changed.' : null;
@@ -58,15 +65,15 @@ function targetBytes(view) {
 }
 function validation() {
   const view = current();
-  if (view.documents.some((doc) => doc.locked)) return false;
+  if (outputDocuments(view).some((doc) => doc.locked)) return false;
   const changes = changesFor(view);
   if (changes.blocked) return false;
   if (changes.flatten && !view.flattenForms) return false;
   if (changes.acknowledge && !view.acknowledgeChanges) return false;
   if (mode === 'merge') return view.documents.length >= 2 && view.documents.reduce((sum, doc) => sum + doc.pages, 0) <= 20000;
   if (mode === 'compress') return view.documents.length > 0 && !(view.targetSize.trim() && targetBytes(view) === null);
+  if (mode === 'organize') return view.pages.length > 0 && view.pages.length <= 20000;
   if (view.documents.length !== 1) return false;
-  if (mode === 'organize') return view.pages.length > 0;
   if (mode === 'split') { try { splitPlanFor(view); } catch { return false; } }
   return true;
 }
@@ -104,7 +111,7 @@ function controls() {
   for (const control of document.querySelectorAll('.file-actions button, .page-actions button')) control.disabled = busy || control.dataset.boundary === 'true';
   $('save-label').textContent = mode === 'split' && view.splitMode === 'selected' ? 'Extract pages' : mode === 'compress' && view.compressionPreview ? (view.documents.length > 1 ? 'Save PDFs' : 'Save PDF') : mode === 'compress' && view.documents.length > 1 ? 'Compress PDFs' : tools[mode].action;
   compressionSummary();
-  $('add-label').textContent = ['merge', 'compress'].includes(mode) ? 'Add PDFs' : view.documents.length ? 'Replace PDF' : 'Add PDF';
+  $('add-label').textContent = ['merge', 'organize'].includes(mode) ? 'Add files' : mode === 'compress' ? 'Add PDFs' : view.documents.length ? 'Replace PDF' : 'Add PDF';
 }
 function actionButton(label, symbol, action, disabled = false) {
   const element = document.createElement('button'); element.className = 'icon-button'; element.title = label;
@@ -172,6 +179,7 @@ function renderPages() {
     const position = start + offset; const card = document.createElement('div'); card.className = 'page-card'; card.tabIndex = 0;
     card.setAttribute('role', 'button'); card.setAttribute('aria-label', mode === 'split' ? `Page ${page.page}. ${view.splitMode === 'after' ? 'Toggle split point' : 'Select'}. Press Enter to preview.` : `Output page ${position + 1}, original page ${page.page}. Select, or press Enter to preview.`);
     card.dataset.page = String(pageKey(page));
+    if (mode === 'organize') card.title = `${view.documents.find((doc) => doc.id === page.documentId)?.name || ''}, page ${page.page}`;
     if (mode === 'organize') reorderable(card, position, card, () => busy, (from, to, after) => {
       const pages = movePagesBeside(view.pages, view.selected, pageKey(view.pages[to]), after);
       if (pages.map(pageKey).join(',') === view.pages.map(pageKey).join(',')) return;
@@ -180,9 +188,10 @@ function renderPages() {
       if (!view.selected.has(pageKey(page))) view.selected = new Set([pageKey(page)]);
       updateSelection(); return view.selected.size;
     } });
-    const paper = document.createElement('div'); paper.className = 'page-paper'; previews.watch(paper, view.documents[0].id, page.page, page.rotation, view.documents[0].previewBytes);
+    const source = view.documents.find((doc) => doc.id === page.documentId) || view.documents[0];
+    const paper = document.createElement('div'); paper.className = 'page-paper'; previews.watch(paper, source.id, page.page, page.rotation, source.previewBytes);
     const check = document.createElement('span'); check.className = 'page-check'; check.setAttribute('aria-hidden', 'true');
-    const caption = document.createElement('span'); caption.className = 'page-caption'; caption.textContent = `Page ${page.page}${page.rotation ? `, rotated ${page.rotation} degrees` : ''}`; card.append(paper, check, caption);
+    const caption = document.createElement('span'); caption.className = 'page-caption'; caption.textContent = `Page ${mode === 'organize' ? position + 1 : page.page}${page.rotation ? `, rotated ${page.rotation} degrees` : ''}`; card.append(paper, check, caption);
     {
       const actions = document.createElement('div'); actions.className = 'page-actions';
       const preview = actionButton(`Preview page ${page.page}`, 'preview', () => openPreview(page));
@@ -300,6 +309,8 @@ function renderChanges() {
   $('flatten-forms').checked = view.flattenForms; $('acknowledge-changes').checked = view.acknowledgeChanges;
 }
 function render() {
+  document.querySelector('.drop-label').textContent = ['merge', 'organize'].includes(mode) ? 'Drop PDFs or images here' : 'Drop PDFs here';
+  $('choose-label').textContent = ['merge', 'organize'].includes(mode) ? 'Choose files' : mode === 'compress' ? 'Choose PDFs' : 'Choose a PDF';
   const previousCards = mode === 'organize' ? new Map([...$('page-grid').children].map((card) => [card.dataset.page, card.getBoundingClientRect()])) : new Map();
   previews.resetView(); const view = current(); const hasDocuments = view.documents.length > 0;
   $('empty').hidden = hasDocuments; $('loaded').hidden = !hasDocuments;
@@ -331,7 +342,7 @@ function resetEdits(view) {
 }
 async function removeDocument(id) {
   if (busy) return; busy = true;
-  invalidateCompression(); current().documents = current().documents.filter((doc) => doc.id !== id); current().pages = []; current().selected.clear(); current().history = []; current().result = null; resetEdits(current()); render();
+  invalidateCompression(); current().documents = current().documents.filter((doc) => doc.id !== id); current().pages = mode === 'organize' ? current().pages.filter((page) => page.documentId !== id) : []; current().selected.clear(); current().history = []; current().result = null; resetEdits(current()); render();
   try { await cleanRegistry(); message('Document removed.'); }
   catch (error) { message(String(error), 'error'); }
   finally { busy = false; render(); }
@@ -345,6 +356,21 @@ async function acceptSelection(selected, insertionIndex) {
       const index = view.documents.findIndex((old) => old.id === doc.id);
       if (index === -1) view.documents.splice(position++, 0, doc); else view.documents[index] = doc;
     }
+  } else if (mode === 'organize') {
+    if (view.pages.length + selected.reduce((sum, doc) => sum + doc.pages, 0) > 20000) throw new Error('Choose at most 20,000 pages.');
+    const added = pagesFromDocuments(selected, () => --duplicateKey);
+    rememberEdit();
+    const position = insertionIndex ?? view.pages.length;
+    let pendingPosition = position;
+    for (const doc of selected) {
+      const existing = view.documents.findIndex((item) => item.id === doc.id);
+      if (doc.locked) doc.insertionIndex = pendingPosition;
+      pendingPosition += doc.pages;
+      if (existing < 0) view.documents.push(doc); else view.documents[existing] = doc;
+    }
+    view.pages = insertPages(view.pages, added, position);
+    view.selected = new Set(added.map(pageKey));
+    view.pageWindow = Math.floor(position / PAGE_WINDOW); lastSelected = null;
   } else {
     view.documents = selected;
     view.pages = ['organize', 'split'].includes(mode) ? Array.from({ length: selected[0].pages }, (_, index) => ({ page: index + 1, rotation: 0 })) : [];
@@ -369,39 +395,73 @@ function promptNextLocked() {
   if (locked) promptPassword(locked);
 }
 async function choose() {
-  if (busy || !ready) return; busy = true; controls(); message('Select PDFs');
+  if (busy || !ready) return; busy = true; controls(); message(['merge', 'organize'].includes(mode) ? 'Select files' : 'Select PDFs');
   let added = [];
   try {
-    const selected = await invoke('choose_documents', { multiple: ['merge', 'compress'].includes(mode) });
+    const selected = await invoke('choose_documents', { multiple: ['merge', 'compress', 'organize'].includes(mode), allowImages: ['merge', 'organize'].includes(mode) });
     if (!selected.length) { message('Selection cancelled.'); return; }
     added = selected;
-    await acceptSelection(selected); message(`${selected.length} ${selected.length === 1 ? 'PDF added' : 'PDFs added'}`);
+    await acceptSelection(selected); message(`${selected.length} ${selected.length === 1 ? 'file added' : 'files added'}`);
   } catch (error) { message(String(error), 'error'); } finally { busy = false; render(); }
   promptNextLocked();
 }
 async function importDrop(paths, position) {
-  $('content-scroll').classList.remove('file-drop-active');
+  if ($('preview-dialog').open || $('password-dialog').open) { clearDropIndicator(); return; }
   if (busy) { message('Wait until processing finishes.'); return; }
   if (!ready) { message('PDF engine unavailable.', 'error'); return; }
-  if (!['merge', 'compress'].includes(mode) && paths.length > 1) { message('This tool uses one PDF at a time.', 'error'); return; }
+  if (mode === 'split' && paths.length > 1) { message('This tool uses one PDF at a time.', 'error'); return; }
   const row = position ? document.elementFromPoint(position.x / window.devicePixelRatio, position.y / window.devicePixelRatio)?.closest('.document') : null;
-  const insertionIndex = mode === 'merge' && row ? Number(row.dataset.reorderIndex) : undefined;
-  busy = true; controls(); message('Adding PDFs...');
+  const insertionIndex = mode === 'organize' ? organizeDropTarget(position).index : mode === 'merge' && row ? Number(row.dataset.reorderIndex) : undefined;
+  clearDropIndicator();
+  busy = true; controls(); message(['merge', 'organize'].includes(mode) ? 'Adding files...' : 'Adding PDFs...');
   let added = [];
   try {
-    const selected = await invoke('import_dropped_documents', { paths });
+    const selected = await invoke('import_dropped_documents', { paths, allowImages: ['merge', 'organize'].includes(mode) });
     added = selected;
     await acceptSelection(selected, insertionIndex);
-    message(`${selected.length} ${selected.length === 1 ? 'PDF added' : 'PDFs added'}`);
+    message(`${selected.length} ${selected.length === 1 ? 'file added' : 'files added'}`);
   } catch (error) { message(String(error), 'error'); } finally { busy = false; render(); }
   promptNextLocked();
+}
+const dropIndicator = document.createElement('div');
+dropIndicator.className = 'file-drop-indicator'; dropIndicator.hidden = true;
+dropIndicator.setAttribute('role', 'status'); dropIndicator.setAttribute('aria-live', 'polite'); document.body.append(dropIndicator);
+let dropCard = null;
+function organizeDropTarget(position) {
+  if (!position) return { index: current().pages.length, card: null, after: true };
+  const x = position.x / window.devicePixelRatio, y = position.y / window.devicePixelRatio;
+  const grid = $('page-grid').getBoundingClientRect();
+  if ($('organizer').hidden || x < grid.left || x > grid.right || y < grid.top || y > grid.bottom) return { index: current().pages.length, card: null, after: true };
+  const cards = [...$('page-grid').children].map((element) => ({ element, index: Number(element.dataset.reorderIndex), rect: element.getBoundingClientRect() }));
+  return insertionAtPoint(cards, x, y, current().pages.length);
+}
+function clearDropIndicator() {
+  dropCard?.classList.remove('drag-target', 'drag-after'); dropCard = null;
+  dropIndicator.hidden = true; $('content-scroll').classList.remove('file-drop-active');
+}
+function showDropIndicator(position) {
+  clearDropIndicator();
+  if (busy || !ready || $('preview-dialog').open || $('password-dialog').open) return;
+  $('content-scroll').classList.add('file-drop-active');
+  if (mode !== 'organize') return;
+  if (position) {
+    const scroll = $('content-scroll'); const rect = scroll.getBoundingClientRect();
+    const y = position.y / window.devicePixelRatio;
+    if (y > rect.bottom - 48 && y < rect.bottom) scroll.scrollTop += 16;
+    else if (y < rect.top + 48 && y > rect.top) scroll.scrollTop -= 16;
+  }
+  const target = organizeDropTarget(position);
+  dropCard = target.card?.element || null;
+  dropCard?.classList.add('drag-target'); dropCard?.classList.toggle('drag-after', target.after);
+  dropIndicator.textContent = target.index === current().pages.length ? 'Add pages at end' : `Insert before page ${target.index + 1}`;
+  dropIndicator.hidden = false;
 }
 // Stop the browser's default file navigation even outside the document list.
 for (const type of ['dragover', 'drop']) window.addEventListener(type, (event) => event.preventDefault(), true);
 try {
   const unlisten = await getCurrentWebview().onDragDropEvent(({ payload }) => {
-    if (payload.type === 'enter' || payload.type === 'over') $('content-scroll').classList.toggle('file-drop-active', !busy && ready);
-    if (payload.type === 'leave') $('content-scroll').classList.remove('file-drop-active');
+    if (payload.type === 'enter' || payload.type === 'over') showDropIndicator(payload.position);
+    if (payload.type === 'leave') clearDropIndicator();
     if (payload.type === 'drop') importDrop(payload.paths, payload.position);
   });
   window.addEventListener('beforeunload', () => { unlisten(); }, { once: true });
@@ -462,7 +522,7 @@ async function save() {
   controls(); message(mode === 'split' || (mode === 'compress' && view.documents.length > 1) ? 'Select output folder' : 'Select save location');
   try {
     const splitRanges = mode === 'split' ? splitPlanFor(view).map(pageList).join(';') : view.ranges;
-    const result = await invoke('process_documents', { request: { jobId, operation: mode, ids: view.documents.map((doc) => doc.id), compression: view.compression, previewId: view.compressionPreview?.id ?? null, splitMode: mode === 'split' ? 'ranges' : 'every_page', pagesPerFile: Number(view.groupSize), ranges: splitRanges, pages: view.pages.map((page) => ({ page: page.page, rotation: page.rotation })), targetBytes: mode === 'compress' ? targetBytes(view) : null, outputNames: mode === 'split' ? splitOutputNames(view) : [], flattenForms: view.flattenForms, acknowledgeChanges: view.acknowledgeChanges }, onProgress });
+    const result = await invoke('process_documents', { request: { jobId, operation: mode, ids: outputDocuments(view).map((doc) => doc.id), compression: view.compression, previewId: view.compressionPreview?.id ?? null, splitMode: mode === 'split' ? 'ranges' : 'every_page', pagesPerFile: Number(view.groupSize), ranges: splitRanges, pages: view.pages.map((page) => ({ documentId: page.documentId || '', page: page.page, rotation: page.rotation })), targetBytes: mode === 'compress' ? targetBytes(view) : null, outputNames: mode === 'split' ? splitOutputNames(view) : [], flattenForms: view.flattenForms, acknowledgeChanges: view.acknowledgeChanges }, onProgress });
     if (!result) { message('Save cancelled.'); return; } view.result = result;
     let text = activeMode !== 'split' && result.files === 1 ? `Saved ${result.name}. ${bytes(result.outputBytes)}.` : `Saved ${result.files} PDFs in ${result.name}.`;
     if (activeMode === 'compress') text += result.outputBytes < result.inputBytes ? ` ${Math.round((1 - result.outputBytes / result.inputBytes) * 100)}% smaller.` : result.recovered ? ' Saved a repaired copy.' : ' Already optimized. Saved an unchanged copy.';
@@ -497,10 +557,10 @@ function duplicateSelected() {
 }
 function openDocumentPreview(doc, pageNumber = null) {
   if (busy || doc.locked || $('preview-dialog').open) return;
-  const edited = mode === 'organize';
+  const edited = mode === 'organize' && current().pages.length > 0;
   previewSession = {
     doc, pages: edited ? current().pages.map((page) => ({ ...page })) : null,
-    index: edited && pageNumber !== null ? Math.max(0, current().pages.findIndex((page) => page.page === pageNumber)) : (pageNumber ?? 1) - 1,
+    index: edited && pageNumber !== null ? Math.max(0, current().pages.findIndex((page) => page.page === pageNumber)) : edited ? Math.max(0, current().pages.findIndex((page) => page.documentId === doc.id)) : (pageNumber ?? 1) - 1,
     count: edited ? current().pages.length : doc.pages,
     compare: null,
   };
@@ -519,25 +579,70 @@ function openCompare() {
   $('preview-dialog').showModal();
   renderPreview();
 }
-function openPreview(page) { openDocumentPreview(current().documents[0], page.page); if (mode === 'organize' && previewSession) { previewSession.index = current().pages.findIndex((item) => pageKey(item) === pageKey(page)); renderPreview(); } }
+function openPreview(page) {
+  const doc = current().documents.find((item) => item.id === page.documentId) || current().documents[0];
+  openDocumentPreview(doc, page.page);
+  if (mode === 'organize' && previewSession) { previewSession.index = current().pages.findIndex((item) => pageKey(item) === pageKey(page)); renderPreview(); }
+}
 async function renderPreview() {
   if (!previewSession || !$('preview-dialog').open) return;
+  const sequence = ++previewRenderSequence;
   const { doc, pages, index, count, compare } = previewSession;
   $('compressed-pane').hidden = !compare; $('original-label').hidden = !compare; $('preview-panes').classList.toggle('comparing', Boolean(compare));
   const page = pages ? pages[index] : { page: index + 1, rotation: 0 };
+  const source = pages ? state.organize.documents.find((item) => item.id === page.documentId) || doc : doc;
+  if (pages) $('preview-title').textContent = source.name;
   $('preview-page').value = String(index + 1); $('preview-page').max = String(count);
   $('preview-total').textContent = `of ${count}`;
   $('preview-previous').disabled = index === 0; $('preview-next').disabled = index === count - 1;
   const zoom = Number($('preview-zoom').value);
   const host = $('large-preview'); host.textContent = 'Preparing preview...'; host.scrollTop = 0; host.scrollLeft = 0;
-  const width = Math.max(200, host.clientWidth - 44) * zoom;
-  await previews.draw({ host, id: doc.id, page: page.page, rotation: page.rotation, width, bytes: doc.previewBytes });
-  if (compare && previewSession && previewSession.compare === compare && $('preview-dialog').open) {
+  const width = Math.max(1, host.clientWidth - 44) * zoom;
+  const height = Math.max(1, host.clientHeight - 44) * zoom;
+  await previews.draw({ host, id: source.id, page: page.page, rotation: page.rotation, width, height, bytes: source.previewBytes });
+  if (sequence === previewRenderSequence && compare && previewSession && previewSession.compare === compare && $('preview-dialog').open) {
     const compressedHost = $('compressed-preview'); compressedHost.textContent = 'Preparing preview...'; compressedHost.scrollTop = 0; compressedHost.scrollLeft = 0;
-    const compressedWidth = Math.max(200, compressedHost.clientWidth - 44) * zoom;
-    await previews.draw({ host: compressedHost, id: doc.id, previewId: compare.previewId, outputIndex: compare.outputIndex, page: page.page, rotation: page.rotation, width: compressedWidth, bytes: compare.bytes });
+    const compressedWidth = Math.max(1, compressedHost.clientWidth - 44) * zoom;
+    const compressedHeight = Math.max(1, compressedHost.clientHeight - 44) * zoom;
+    await previews.draw({ host: compressedHost, id: doc.id, previewId: compare.previewId, outputIndex: compare.outputIndex, page: page.page, rotation: page.rotation, width: compressedWidth, height: compressedHeight, bytes: compare.bytes });
   }
 }
+function resizePreview(width, height) {
+  const dialog = $('preview-dialog');
+  dialog.style.width = `${Math.max(Math.min(480, innerWidth - 32), Math.min(width, innerWidth - 32))}px`;
+  dialog.style.height = `${Math.max(Math.min(420, innerHeight - 32), Math.min(height, innerHeight - 32))}px`;
+}
+$('preview-resize').addEventListener('pointerdown', (event) => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  const grip = event.currentTarget;
+  const rect = $('preview-dialog').getBoundingClientRect();
+  const startX = event.clientX, startY = event.clientY;
+  grip.setPointerCapture(event.pointerId);
+  const move = (next) => resizePreview(rect.width + (next.clientX - startX) * 2, rect.height + (next.clientY - startY) * 2);
+  const stop = () => { grip.removeEventListener('pointermove', move); grip.removeEventListener('pointerup', stop); grip.removeEventListener('pointercancel', stop); };
+  grip.addEventListener('pointermove', move);
+  grip.addEventListener('pointerup', stop);
+  grip.addEventListener('pointercancel', stop);
+});
+$('preview-resize').addEventListener('keydown', (event) => {
+  const directions = { ArrowLeft: [-20, 0], ArrowRight: [20, 0], ArrowUp: [0, -20], ArrowDown: [0, 20] };
+  if (!directions[event.key]) return;
+  event.preventDefault();
+  const rect = $('preview-dialog').getBoundingClientRect();
+  const [width, height] = directions[event.key];
+  resizePreview(rect.width + width, rect.height + height);
+});
+let previewResizeTimer = null;
+let previewSize = '';
+new ResizeObserver(([entry]) => {
+  const size = `${Math.round(entry.contentRect.width)}:${Math.round(entry.contentRect.height)}`;
+  if (size === previewSize) return;
+  previewSize = size;
+  if (!previewSession || !$('preview-dialog').open) return;
+  clearTimeout(previewResizeTimer);
+  previewResizeTimer = setTimeout(() => { previewResizeTimer = null; renderPreview(); }, 120);
+}).observe($('preview-dialog'));
 function movePreview(offset) {
   if (!previewSession) return;
   previewSession.index = Math.max(0, Math.min(previewSession.count - 1, previewSession.index + offset));
@@ -552,8 +657,8 @@ async function checkEngine() {
 function setMode(next) {
   if (busy || next === mode) return; mode = next; lastSelected = null; const tool = tools[mode];
   document.title = tool.heading; invoke('set_view_title', { tool: mode }).catch(() => {}); $('heading').textContent = tool.heading; $('save-label').textContent = tool.action;
-  $('choose-label').textContent = ['merge', 'compress'].includes(mode) ? 'Choose PDFs' : 'Choose a PDF';
-  $('list-label').textContent = ['merge', 'compress'].includes(mode) ? 'Documents' : 'Document';
+  $('choose-label').textContent = ['merge', 'organize'].includes(mode) ? 'Choose files' : mode === 'compress' ? 'Choose PDFs' : 'Choose a PDF';
+  $('list-label').textContent = ['merge', 'compress', 'organize'].includes(mode) ? 'Documents' : 'Document';
   $('split-mode').value = current().splitMode; $('group-size').value = current().groupSize; $('split-ranges').value = current().ranges; $('split-cuts').value = current().splitCuts; $('split-separate').checked = current().splitSeparate; $('split-combine').checked = current().splitCombine;
   $('target-size').value = current().targetSize;
   for (const input of document.querySelectorAll('input[name="compression"]')) input.checked = input.value === current().compression;
@@ -584,8 +689,16 @@ $('password-form').addEventListener('submit', async (event) => {
   for (const [tool, view] of Object.entries(state)) {
     const index = view.documents.findIndex((item) => item.id === info.id);
     if (index === -1) continue;
+    const previous = view.documents[index];
     view.documents[index] = info;
-    if (['split', 'organize'].includes(tool)) {
+    if (tool === 'organize') {
+      view.history.push(view.pages.map((page) => ({ ...page }))); view.future = [];
+      const added = pagesFromDocuments([info], () => --duplicateKey);
+      const position = Math.min(previous.insertionIndex ?? view.pages.length, view.pages.length);
+      view.pages = insertPages(view.pages, added, position);
+      for (const pending of view.documents) if (pending.locked && pending.insertionIndex >= position) pending.insertionIndex += added.length;
+      view.selected = new Set(added.map(pageKey)); view.result = null;
+    } else if (tool === 'split') {
       view.pages = Array.from({ length: info.pages }, (_, page) => ({ page: page + 1, rotation: 0 }));
       view.selected.clear(); view.history = []; view.future = []; view.pageWindow = 0; view.result = null;
     }

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod workspace;
+mod image_import;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -771,6 +772,14 @@ fn select_paths(
         let file = tempfile::Builder::new().suffix(".pdf").tempfile_in(store.workspace.path()).map_err(|_| "Cannot create a working copy.")?;
         copy_into(&path, file.as_file(), None)?;
         let source_digest = digest(file.path(), None)?;
+        if image_import::supported(&path) {
+            let converted = tempfile::Builder::new().suffix(".pdf").tempfile_in(store.workspace.path()).map_err(|_| "Cannot create image page.")?;
+            image_import::convert(file.path(), converted.path())?;
+            let mut document = inspect(engine, converted.path(), None)?;
+            document.path = path; document.bytes = file.as_file().metadata().map_err(|_| "Cannot inspect image.")?.len();
+            document.source_digest = source_digest; document.working = Some(Arc::new(converted));
+            return Ok(document);
+        }
         let (encrypted, _) = run(Command::new(engine).arg("--is-encrypted").arg(file.path()), None)?;
         if encrypted == 0 {
             let (requires_password, _) = run(Command::new(engine).arg("--requires-password").arg(file.path()), None)?;
@@ -827,6 +836,7 @@ async fn import_dropped_documents(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<Store>>,
     paths: Vec<String>,
+    allow_images: bool,
 ) -> Result<Vec<DocumentInfo>, String> {
     let store = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -855,8 +865,9 @@ async fn import_dropped_documents(
                 || !path
                     .extension()
                     .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("pdf"))
+                    && !(allow_images && image_import::supported(path))
         }) {
-            return Err("Drop PDF files only.".into());
+            return Err(if allow_images { "Choose PDFs, JPEG, PNG, or WebP images." } else { "Drop PDF files only." }.into());
         }
         let engine = engine(&app)?;
         check_version(&engine)?;
@@ -871,6 +882,7 @@ async fn choose_documents(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<Store>>,
     multiple: bool,
+    allow_images: bool,
 ) -> Result<Vec<DocumentInfo>, String> {
     let store = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -880,7 +892,7 @@ async fn choose_documents(
             .map_err(|_| "Another operation is in progress.")?;
         let engine = engine(&app)?;
         check_version(&engine)?;
-        let dialog = rfd::FileDialog::new().add_filter("PDF documents", &["pdf"]);
+        let dialog = if allow_images { rfd::FileDialog::new().add_filter("PDFs and images", &["pdf", "jpg", "jpeg", "png", "webp"]) } else { rfd::FileDialog::new().add_filter("PDF documents", &["pdf"]) };
         let paths = if multiple {
             dialog.pick_files()
         } else {
@@ -1420,6 +1432,12 @@ fn main() {
         .manage(Store::new().expect("Cannot initialize private storage"))
         // Tauri routes the main window's webview drops through WindowEvent.
         .on_window_event(|window, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" && window.hide().is_ok() {
+                    api.prevent_close();
+                }
+            }
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
                 let state = window.state::<Arc<Store>>();
                 if let Ok(mut allowed) = state.dropped_paths.lock() {
@@ -1450,6 +1468,14 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("Cannot start PDF Tools")
         .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { has_visible_windows: false, .. } = &event {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
             if matches!(event, tauri::RunEvent::Exit) {
                 let state = app.state::<Arc<Store>>();
                 if let Ok(mut docs) = state.documents.lock() { docs.clear(); }

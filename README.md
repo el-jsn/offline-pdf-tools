@@ -5,7 +5,7 @@ Documents are never uploaded.
 
 ## Features
 
-- Merge multiple PDFs in the order you choose.
+- Merge PDFs and JPEG, PNG, or WebP images in the order you choose. Each image becomes one page, preserving its proportions and orientation, with transparency on white. Images are limited to 32 megapixels; animated images use their first frame. HEIC is not supported.
 - Compress individually or in batches: Balanced by default, with lossless and Smallest options.
 - Balanced and Smallest resize and recompress embedded images, including CMYK photographs. Text and vector objects are preserved.
 - See the actual compressed size before saving and compare the original and compressed pages. Set an optional limit per PDF; an unmet limit is identified. Saving uses the measured output.
@@ -76,4 +76,6 @@ Transparency masks, one-bit images, ambiguous image dictionaries, and images abo
 32 million pixels are preserved. Other presets can reduce image quality. A file that cannot be made smaller is saved as an unchanged copy.
 
 PDF processing and previews work offline. Update checks and installer downloads
-contact GitHub only when requested. Private working copies are removed when cleared or closed. Abandoned private workspaces are reclaimed on a later launch; active instances are protected by file locks. A forced quit during the final output publication step can leave a staging file in the selected destination.
+contact GitHub only when requested. Private working copies are removed when cleared or the app quits. Closing the Mac window keeps the current session in memory and its private workspace available. Abandoned private workspaces are reclaimed on a later launch; active instances are protected by file locks. A forced quit during the final output publication step can leave a staging file in the selected destination.
+
+Organize accepts PDFs and JPEG, PNG, or WebP images through Add files or file drops. Drop beside a page to insert there, or outside the grid to append. Added pages retain their source for previews and saving, and insertion can be undone.

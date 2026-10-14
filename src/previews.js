@@ -83,7 +83,8 @@ export class Previews {
       const angle = (pdfPage.rotate + (spec.rotation || 0)) % 360;
       const width = spec.width || 150;
       const initial = pdfPage.getViewport({ scale: 1, rotation: angle });
-      const viewport = pdfPage.getViewport({ scale: width / initial.width, rotation: angle });
+      const scale = Math.min(width / initial.width, spec.height > 0 ? spec.height / initial.height : Infinity);
+      const viewport = pdfPage.getViewport({ scale, rotation: angle });
       const ratio = Math.min(window.devicePixelRatio || 1, 2);
       const canvas = document.createElement('canvas');
       canvas.width = Math.ceil(viewport.width * ratio); canvas.height = Math.ceil(viewport.height * ratio);
