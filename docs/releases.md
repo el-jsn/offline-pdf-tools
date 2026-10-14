@@ -70,7 +70,8 @@ code does not publish releases or push commits automatically.
 
 ## Update contract
 
-The app checks this URL only when the user clicks Check for updates:
+The app checks this URL at launch at most once every 24 hours, and whenever
+the user clicks Check for updates:
 
 `https://github.com/el-jsn/offline-pdf-tools/releases/latest/download/latest.json`
 
@@ -84,7 +85,11 @@ included only when its artifact has been built. Artifact URLs use the immutable
 When a newer version is available, the app offers Install. A native dialog confirms
 the restart and loss of unsaved selections. Installation is blocked during PDF
 operations. The updater verifies the signed download before installing and then
-restarts the app. There are no background checks or PDF uploads.
+restarts the app. Automatic checks fetch only the update manifest. They do not hold the PDF
+operation lock or download/install an update. Offline failures stay quiet; attempts
+are throttled even after failures, and an available-update notice persists across
+restarts. Downloads and installation require the user to click the update button
+and confirm. No PDFs are uploaded.
 
 The first published release is necessary before the live update endpoint works.
 The updater has been compiled into the Mac app, but a published version-to-version

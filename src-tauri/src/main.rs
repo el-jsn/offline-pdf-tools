@@ -1118,10 +1118,7 @@ async fn check_app_update(
 ) -> Result<Option<UpdateInfo>, String> {
     let store = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _busy = store
-            .operation
-            .try_lock()
-            .map_err(|_| "Finish the current operation before checking for updates.")?;
+        // Network checks do not hold the PDF operation lock.
         *store
             .pending_update
             .lock()

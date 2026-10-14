@@ -828,3 +828,12 @@ input[aria-invalid=true] { border-color:#a43131; }
   .page-card,.page-actions { transition:none; }
   .drag-ghost { transform:none; }
 }
+
+.sidebar-bottom #app-update.update-available {
+  padding:7px 13px;
+  border-radius:999px;
+  background:var(--accent);
+  color:#fff;
+  font-weight:600;
+}
+.sidebar-bottom #app-update.update-available:hover:not(:disabled) { background:#005ab4; }

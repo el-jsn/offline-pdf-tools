@@ -5,6 +5,7 @@ import { reorderable } from './reorder.js';
 import { icon } from './icons.js';
 import { Previews } from './previews.js';
 import { splitPlan, parseRange, pageList, movePagesTo, movePagesBeside } from './model.js';
+import { UpdateChecks } from './updates.js';
 import './styles.css';
 
 const $ = (id) => document.getElementById(id);
@@ -21,7 +22,9 @@ const state = Object.fromEntries(Object.keys(tools).map((tool) => [tool, {
 }]));
 let mode = 'merge'; let busy = false; let ready = false; let jobId = null; let cancelAvailable = false; let lastSelected = null;
 let compressionTimer = null;
-let pendingUpdate = null;
+let pendingUpdate = null; let updateChecking = false; let availableUpdateVersion = null;
+let updateStorage; try { updateStorage = window.localStorage; } catch { /* Storage may be unavailable. */ }
+const updateChecks = new UpdateChecks(updateStorage);
 const PAGE_WINDOW = 48;
 const current = () => state[mode];
 const previews = new Previews();
@@ -39,7 +42,11 @@ function validation() {
 function controls() {
   const view = current();
   $('save').disabled = busy || !ready || !validation() || (mode === 'compress' && !view.compressionPreview && !view.measurementFailed); $('clear').disabled = busy;
-  $('app-update').disabled = busy;
+  $('app-update').disabled = busy || updateChecking;
+  $('app-update').classList.toggle('update-available', Boolean(availableUpdateVersion));
+  $('app-update').textContent = availableUpdateVersion ? 'Update available' : 'Check for updates';
+  $('app-update').title = availableUpdateVersion ? `Install version ${availableUpdateVersion}` : '';
+  $('app-update').setAttribute('aria-label', availableUpdateVersion ? `Update available. Install version ${availableUpdateVersion}` : 'Check for updates');
   $('release-notes').disabled = busy;
   $('add').disabled = busy || !ready; $('choose').disabled = busy || !ready;
   $('busy-indicator').hidden = !busy; $('loaded').setAttribute('aria-busy', String(busy));
@@ -403,25 +410,35 @@ $('clear').addEventListener('click', async () => {
   catch (error) { message(String(error), 'error'); }
   finally { busy = false; controls(); }
 });
+async function fetchUpdate() {
+  const update = await invoke('check_app_update');
+  pendingUpdate = update; availableUpdateVersion = update?.version || null; updateChecks.remember(availableUpdateVersion); controls(); return update;
+}
+async function automaticUpdateCheck(installedVersion) {
+  availableUpdateVersion = updateChecks.available(installedVersion); controls();
+  if (!updateChecks.claim()) return;
+  updateChecking = true; controls();
+  try { await fetchUpdate(); } catch { /* Offline launches remain quiet. Try again manually or on a later launch. */ }
+  finally { updateChecking = false; controls(); }
+}
 $('app-update').addEventListener('click', async () => {
-  if (busy) return;
+  if (busy || updateChecking) return;
   clearTimeout(compressionTimer); busy = true; cancelAvailable = false; controls();
   try {
-    if (pendingUpdate) {
+    if (availableUpdateVersion) {
+      if (!pendingUpdate) await fetchUpdate();
+      if (!pendingUpdate) { message('You have the latest version.'); return; }
       const approved = await invoke('confirm_app_update', { version: pendingUpdate.version });
       if (!approved) return;
       const onProgress = new Channel(); onProgress.onmessage = (progress) => message(progress.message);
       await invoke('install_app_update', { updateId: pendingUpdate.id, onProgress });
     } else {
       message('Checking for updates...');
-      pendingUpdate = await invoke('check_app_update');
-      if (pendingUpdate) {
-        $('app-update').textContent = `Install ${pendingUpdate.version}`;
-        message(`Version ${pendingUpdate.version} is available.`);
-      } else message('You have the latest version.');
+      await fetchUpdate();
+      message(availableUpdateVersion ? `Version ${availableUpdateVersion} is available.` : 'You have the latest version.');
     }
   } catch (error) {
-    pendingUpdate = null; $('app-update').textContent = 'Check for updates'; message(String(error), String(error).startsWith('No update') ? '' : 'error');
+    pendingUpdate = null; message(String(error), String(error).startsWith('No update') ? '' : 'error');
   } finally { busy = false; controls(); scheduleCompression(); }
 });
 $('release-notes').addEventListener('click', async () => {
@@ -472,5 +489,6 @@ document.addEventListener('keydown', (event) => {
   if (event.key.toLowerCase() === 's') { event.preventDefault(); save(); }
   if (event.key.toLowerCase() === 'z' && mode === 'organize' && !['INPUT', 'TEXTAREA'].includes(event.target.tagName)) { event.preventDefault(); $('undo').click(); }
 });
-getVersion().then((version) => { $('app-version').textContent = `Version ${version}`; $('app-version').hidden = false; }).catch(() => {});
-render(); checkEngine();
+const installedVersion = getVersion().then((version) => { $('app-version').textContent = `Version ${version}`; $('app-version').hidden = false; return version; }).catch(() => null);
+render();
+Promise.all([checkEngine(), installedVersion]).then(([, version]) => { if (version) automaticUpdateCheck(version); });
