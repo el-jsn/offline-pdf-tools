@@ -32,7 +32,7 @@ so operating system security warnings may appear.
 
 ## Build
 
-Requires Node 22.16+, npm, Rust, and the [Tauri platform prerequisites](https://v2.tauri.app/start/prerequisites/).
+Requires Node 22.16+, npm, Rust 1.90+, and the [Tauri platform prerequisites](https://v2.tauri.app/start/prerequisites/).
 The bundled PDF engine is qpdf 12.1 or newer. On a fresh checkout, stage its native
 runtime and matching license notices using `scripts/stage-engine.py`.
 

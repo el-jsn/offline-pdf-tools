@@ -949,17 +949,26 @@ fn set_view_title(window: tauri::Window, tool: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn confirm_app_update(version: String) -> Result<bool, String> {
-    if version.len() > 64 || !version.bytes().all(|value| value.is_ascii_alphanumeric() || b".-+".contains(&value)) {
+    if version.len() > 64
+        || !version
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || b".-+".contains(&value))
+    {
         return Err("Invalid update version.".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
         rfd::MessageDialog::new()
             .set_title("Install update")
-            .set_description(format!("Install PDF Tools {version}? The app will restart and clear unsaved selections."))
+            .set_description(format!(
+                "Install PDF Tools {version}? The app will restart and clear unsaved selections."
+            ))
             .set_buttons(rfd::MessageButtons::OkCancel)
             .set_level(rfd::MessageLevel::Info)
-            .show() == rfd::MessageDialogResult::Ok
-    }).await.map_err(|_| "Could not confirm the update.".into())
+            .show()
+            == rfd::MessageDialogResult::Ok
+    })
+    .await
+    .map_err(|_| "Could not confirm the update.".into())
 }
 #[derive(Serialize)]
 struct UpdateInfo {
@@ -973,16 +982,38 @@ async fn check_app_update(
 ) -> Result<Option<UpdateInfo>, String> {
     let store = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _busy = store.operation.try_lock().map_err(|_| "Finish the current operation before checking for updates.")?;
-        *store.pending_update.lock().map_err(|_| "Update status is unavailable.")? = None;
-        let updater = app.updater_builder().timeout(Duration::from_secs(15)).build().map_err(|_| "Updates are unavailable.")?;
-        let update = tauri::async_runtime::block_on(updater.check()).map_err(|_| "Could not check for updates. Try again later.")?;
-        if let Some(update) = update {
-            let info = UpdateInfo { id: uuid::Uuid::new_v4().to_string(), version: update.version.clone() };
-            *store.pending_update.lock().map_err(|_| "Update status is unavailable.")? = Some((info.id.clone(), update));
+        let _busy = store
+            .operation
+            .try_lock()
+            .map_err(|_| "Finish the current operation before checking for updates.")?;
+        *store
+            .pending_update
+            .lock()
+            .map_err(|_| "Update status is unavailable.")? = None;
+        let updater = app
+            .updater_builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|_| "Updates are unavailable.")?;
+        let update = tauri::async_runtime::block_on(updater.check())
+            .map_err(|_| "Could not check for updates. Try again later.")?;
+        if let Some(mut update) = update {
+            update.timeout = Some(Duration::from_secs(1200));
+            let info = UpdateInfo {
+                id: uuid::Uuid::new_v4().to_string(),
+                version: update.version.clone(),
+            };
+            *store
+                .pending_update
+                .lock()
+                .map_err(|_| "Update status is unavailable.")? = Some((info.id.clone(), update));
             Ok(Some(info))
-        } else { Ok(None) }
-    }).await.map_err(|_| "Update check failed.")?
+        } else {
+            Ok(None)
+        }
+    })
+    .await
+    .map_err(|_| "Update check failed.")?
 }
 #[tauri::command]
 async fn install_app_update(
@@ -993,9 +1024,15 @@ async fn install_app_update(
 ) -> Result<(), String> {
     let store = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _busy = store.operation.try_lock().map_err(|_| "Finish the current operation before installing an update.")?;
+        let _busy = store
+            .operation
+            .try_lock()
+            .map_err(|_| "Finish the current operation before installing an update.")?;
         let update = {
-            let mut pending = store.pending_update.lock().map_err(|_| "Update status is unavailable.")?;
+            let mut pending = store
+                .pending_update
+                .lock()
+                .map_err(|_| "Update status is unavailable.")?;
             if pending.as_ref().is_none_or(|(id, _)| id != &update_id) {
                 return Err("Check for updates again before installing.".into());
             }
@@ -1007,14 +1044,24 @@ async fn install_app_update(
             |chunk, total| {
                 downloaded += chunk as u64;
                 if let Some(total) = total.filter(|total| *total > 0) {
-                    progress(&on_progress, format!("Downloading update: {}%", (downloaded.saturating_mul(100) / total).min(100)), false);
+                    progress(
+                        &on_progress,
+                        format!(
+                            "Downloading update: {}%",
+                            (downloaded.saturating_mul(100) / total).min(100)
+                        ),
+                        false,
+                    );
                 }
             },
             || progress(&on_progress, "Verifying and installing update...", false),
-        )).map_err(|_| "Update could not be installed. Check for updates and try again.")?;
+        ))
+        .map_err(|_| "Update could not be installed. Check for updates and try again.")?;
         progress(&on_progress, "Restarting...", false);
         app.restart();
-    }).await.map_err(|_| "Update installation failed.")?
+    })
+    .await
+    .map_err(|_| "Update installation failed.")?
 }
 
 fn main() {

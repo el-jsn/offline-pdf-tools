@@ -2,7 +2,7 @@
 name = "offline-pdf-tools"
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.90"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

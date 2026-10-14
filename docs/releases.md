@@ -2,7 +2,7 @@
 
 ## Build an installer
 
-On the target operating system, install Node 22.16+, npm, Rust, and Tauri's platform
+On the target operating system, install Node 22.16+, npm, Rust 1.90+, and Tauri's platform
 prerequisites. Stage qpdf 12.1+ with its matching native libraries and license notices:
 
 ```sh
