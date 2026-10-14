@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{ipc::Channel, Manager};
+use tauri_plugin_updater::UpdaterExt;
 
 const MAX_BYTES: u64 = 250 * 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
@@ -38,6 +39,7 @@ struct Store {
     job: Mutex<Option<(String, Arc<AtomicBool>)>>,
     results: Mutex<HashMap<String, PathBuf>>,
     compression_preview: Mutex<Option<Arc<CompressionPreview>>>,
+    pending_update: Mutex<Option<(String, tauri_plugin_updater::Update)>>,
 }
 struct CompressionPreview {
     id: String,
@@ -945,8 +947,79 @@ fn set_view_title(window: tauri::Window, tool: String) -> Result<(), String> {
         .map_err(|_| "Cannot update the window title.".into())
 }
 
+#[tauri::command]
+async fn confirm_app_update(version: String) -> Result<bool, String> {
+    if version.len() > 64 || !version.bytes().all(|value| value.is_ascii_alphanumeric() || b".-+".contains(&value)) {
+        return Err("Invalid update version.".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        rfd::MessageDialog::new()
+            .set_title("Install update")
+            .set_description(format!("Install PDF Tools {version}? The app will restart and clear unsaved selections."))
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .set_level(rfd::MessageLevel::Info)
+            .show() == rfd::MessageDialogResult::Ok
+    }).await.map_err(|_| "Could not confirm the update.".into())
+}
+#[derive(Serialize)]
+struct UpdateInfo {
+    id: String,
+    version: String,
+}
+#[tauri::command]
+async fn check_app_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Store>>,
+) -> Result<Option<UpdateInfo>, String> {
+    let store = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _busy = store.operation.try_lock().map_err(|_| "Finish the current operation before checking for updates.")?;
+        *store.pending_update.lock().map_err(|_| "Update status is unavailable.")? = None;
+        let updater = app.updater_builder().timeout(Duration::from_secs(15)).build().map_err(|_| "Updates are unavailable.")?;
+        let update = tauri::async_runtime::block_on(updater.check()).map_err(|_| "Could not check for updates. Try again later.")?;
+        if let Some(update) = update {
+            let info = UpdateInfo { id: uuid::Uuid::new_v4().to_string(), version: update.version.clone() };
+            *store.pending_update.lock().map_err(|_| "Update status is unavailable.")? = Some((info.id.clone(), update));
+            Ok(Some(info))
+        } else { Ok(None) }
+    }).await.map_err(|_| "Update check failed.")?
+}
+#[tauri::command]
+async fn install_app_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Store>>,
+    update_id: String,
+    on_progress: Channel<Progress>,
+) -> Result<(), String> {
+    let store = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _busy = store.operation.try_lock().map_err(|_| "Finish the current operation before installing an update.")?;
+        let update = {
+            let mut pending = store.pending_update.lock().map_err(|_| "Update status is unavailable.")?;
+            if pending.as_ref().is_none_or(|(id, _)| id != &update_id) {
+                return Err("Check for updates again before installing.".into());
+            }
+            pending.take().ok_or("No update is available.")?.1
+        };
+        progress(&on_progress, "Downloading update...", false);
+        let mut downloaded = 0u64;
+        tauri::async_runtime::block_on(update.download_and_install(
+            |chunk, total| {
+                downloaded += chunk as u64;
+                if let Some(total) = total.filter(|total| *total > 0) {
+                    progress(&on_progress, format!("Downloading update: {}%", (downloaded.saturating_mul(100) / total).min(100)), false);
+                }
+            },
+            || progress(&on_progress, "Verifying and installing update...", false),
+        )).map_err(|_| "Update could not be installed. Check for updates and try again.")?;
+        progress(&on_progress, "Restarting...", false);
+        app.restart();
+    }).await.map_err(|_| "Update installation failed.")?
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Arc::new(Store::default()))
         .on_webview_event(|webview, event| {
             if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
@@ -969,7 +1042,10 @@ fn main() {
             process_documents,
             discard_compression_preview,
             reveal_result,
-            set_view_title
+            set_view_title,
+            check_app_update,
+            install_app_update,
+            confirm_app_update
         ])
         .build(tauri::generate_context!())
         .expect("Cannot start PDF Tools")

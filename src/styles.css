@@ -689,3 +689,16 @@ dialog h2 {
   cursor: grabbing !important;
   user-select: none;
 }
+
+.sidebar-bottom {
+  margin-top:auto;
+  padding-top:16px;
+}
+.sidebar-bottom .local-info {
+  margin-top:10px;
+  padding-top:0;
+}
+.sidebar-bottom .text-button {
+  text-align:left;
+  font-size:12px;
+}

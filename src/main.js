@@ -20,6 +20,7 @@ const state = Object.fromEntries(Object.keys(tools).map((tool) => [tool, {
 }]));
 let mode = 'merge'; let busy = false; let ready = false; let jobId = null; let cancelAvailable = false; let lastSelected = null;
 let compressionTimer = null;
+let pendingUpdate = null;
 const PAGE_WINDOW = 48;
 const current = () => state[mode];
 const previews = new Previews();
@@ -37,6 +38,7 @@ function validation() {
 function controls() {
   const view = current();
   $('save').disabled = busy || !ready || !validation() || (mode === 'compress' && !view.compressionPreview && !view.measurementFailed); $('clear').disabled = busy;
+  $('app-update').disabled = busy;
   $('add').disabled = busy || !ready; $('choose').disabled = busy || !ready;
   $('busy-indicator').hidden = !busy; $('loaded').setAttribute('aria-busy', String(busy));
   $('cancel').hidden = !busy || !cancelAvailable; $('reveal').hidden = busy || !view.result;
@@ -307,6 +309,27 @@ $('clear').addEventListener('click', async () => {
   try { await cleanRegistry(); message('Documents cleared.'); }
   catch (error) { message(String(error), 'error'); }
   finally { busy = false; controls(); }
+});
+$('app-update').addEventListener('click', async () => {
+  if (busy) return;
+  clearTimeout(compressionTimer); busy = true; cancelAvailable = false; controls();
+  try {
+    if (pendingUpdate) {
+      const approved = await invoke('confirm_app_update', { version: pendingUpdate.version });
+      if (!approved) return;
+      const onProgress = new Channel(); onProgress.onmessage = (progress) => message(progress.message);
+      await invoke('install_app_update', { updateId: pendingUpdate.id, onProgress });
+    } else {
+      message('Checking for updates...');
+      pendingUpdate = await invoke('check_app_update');
+      if (pendingUpdate) {
+        $('app-update').textContent = `Install ${pendingUpdate.version}`;
+        message(`Version ${pendingUpdate.version} is available.`);
+      } else message('You have the latest version.');
+    }
+  } catch (error) {
+    pendingUpdate = null; $('app-update').textContent = 'Check for updates'; message(String(error), 'error');
+  } finally { busy = false; controls(); scheduleCompression(); }
 });
 $('retry-engine').addEventListener('click', checkEngine);
 $('cancel').addEventListener('click', async () => {

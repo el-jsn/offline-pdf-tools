@@ -1,17 +1,19 @@
 {
   "name": "offline-pdf-tools",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "node scripts/prepare-assets.mjs && vite --host 127.0.0.1 --port 1420 --strictPort",
     "build": "node scripts/prepare-assets.mjs && vite build",
     "desktop": "tauri dev",
-    "package": "tauri build",
+    "package": "node scripts/release.mjs",
     "lint:ui": "node --check src/main.js",
     "assets": "node scripts/prepare-assets.mjs",
     "check:engine": "node scripts/check-engine.mjs",
-    "build:desktop": "node scripts/check-engine.mjs && npm run build"
+    "build:desktop": "node scripts/check-engine.mjs && npm run build",
+    "release": "npm run package",
+    "version:set": "node scripts/set-version.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

@@ -1,6 +1,6 @@
 [package]
 name = "offline-pdf-tools"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.82"
 
@@ -16,3 +16,4 @@ tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 
 sha2 = "0.10"
+tauri-plugin-updater = "2"

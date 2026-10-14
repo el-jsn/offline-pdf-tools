@@ -9,3 +9,13 @@ src-tauri/engine/*
 public/pdfjs/
 src-tauri/pdf-tools-engine-*/
 __pycache__/
+
+releases/
+
+.secrets/
+
+.env
+
+.env.*
+
+*.key
