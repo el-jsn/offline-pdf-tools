@@ -7,6 +7,9 @@ import { Previews } from './previews.js';
 import { splitPlan, parseRange, pageList, movePagesTo, movePagesBeside } from './model.js';
 import { UpdateChecks } from './updates.js';
 import './styles.css';
+import { setupAppearance } from './appearance.js';
+
+setupAppearance();
 
 const $ = (id) => document.getElementById(id);
 const bytes = (value) => value >= 1048576 ? `${(value / 1048576).toFixed(2)} MB` : `${(value / 1024).toFixed(1)} KB`;
@@ -22,6 +25,7 @@ const state = Object.fromEntries(Object.keys(tools).map((tool) => [tool, {
 }]));
 let mode = 'merge'; let busy = false; let ready = false; let jobId = null; let cancelAvailable = false; let lastSelected = null;
 let compressionTimer = null;
+let previewSession = null;
 let pendingUpdate = null; let updateChecking = false; let availableUpdateVersion = null;
 let updateStorage; try { updateStorage = window.localStorage; } catch { /* Storage may be unavailable. */ }
 const updateChecks = new UpdateChecks(updateStorage);
@@ -98,6 +102,10 @@ function renderDocuments() {
       actions.append(actionButton(`Move ${doc.name} earlier`, 'up', () => changeOrder(index, index - 1), index === 0));
       actions.append(actionButton(`Move ${doc.name} later`, 'down', () => changeOrder(index, index + 1), index === current().documents.length - 1));
     }
+    const preview = document.createElement('button'); preview.className = 'secondary';
+    preview.append(icon('preview'), document.createTextNode('Preview'));
+    preview.setAttribute('aria-label', `Preview ${doc.name}`); preview.addEventListener('click', () => openDocumentPreview(doc));
+    actions.append(preview);
     actions.append(actionButton(`Remove ${doc.name}`, 'trash', () => removeDocument(doc.id))); row.append(cover, info, actions); $('documents').append(row);
   });
 }
@@ -133,12 +141,12 @@ function renderPages() {
     const paper = document.createElement('div'); paper.className = 'page-paper'; previews.watch(paper, view.documents[0].id, page.page, page.rotation);
     const check = document.createElement('span'); check.className = 'page-check'; check.setAttribute('aria-hidden', 'true');
     const caption = document.createElement('span'); caption.className = 'page-caption'; caption.textContent = `Page ${page.page}${page.rotation ? `, rotated ${page.rotation} degrees` : ''}`; card.append(paper, check, caption);
-    if (mode === 'organize') {
+    {
       const actions = document.createElement('div'); actions.className = 'page-actions';
       const preview = actionButton(`Preview page ${page.page}`, 'preview', () => openPreview(page));
       const rotate = actionButton(`Rotate page ${page.page}`, 'rotate', () => { if (busy) return; rememberEdit(); page.rotation = (page.rotation + 90) % 360; render(); message('Unsaved changes'); });
       for (const button of [preview, rotate]) button.addEventListener('click', (event) => event.stopPropagation());
-      actions.addEventListener('dblclick', (event) => event.stopPropagation()); actions.append(preview, rotate); card.append(actions);
+      actions.addEventListener('dblclick', (event) => event.stopPropagation()); actions.append(preview); if (mode === 'organize') actions.append(rotate); card.append(actions);
     }
     const select = (event) => {
       if (busy) return;
@@ -380,10 +388,37 @@ function editPages(action) {
   if (action === 'later') for (let index = view.pages.length - 2; index >= 0; index -= 1) { if (view.selected.has(view.pages[index].page) && !view.selected.has(view.pages[index + 1].page)) [view.pages[index + 1], view.pages[index]] = [view.pages[index], view.pages[index + 1]]; }
   render(); message('Unsaved changes');
 }
-async function openPreview(page) {
+function openDocumentPreview(doc, pageNumber = null) {
   if (busy || $('preview-dialog').open) return;
-  $('preview-title').textContent = `Original page ${page.page}`; $('large-preview').textContent = 'Preparing preview...'; $('preview-dialog').showModal();
-  await previews.draw({ host: $('large-preview'), id: current().documents[0].id, page: page.page, rotation: page.rotation, width: 700 });
+  const edited = mode === 'organize';
+  previewSession = {
+    doc, pages: edited ? current().pages.map((page) => ({ ...page })) : null,
+    index: edited && pageNumber !== null ? Math.max(0, current().pages.findIndex((page) => page.page === pageNumber)) : (pageNumber ?? 1) - 1,
+    count: edited ? current().pages.length : doc.pages,
+  };
+  $('preview-title').textContent = doc.name;
+  $('preview-source').textContent = mode === 'compress' ? 'Original PDF' : edited ? 'Current page order' : 'Source PDF';
+  $('preview-zoom').value = '1';
+  $('preview-dialog').showModal();
+  renderPreview();
+}
+function openPreview(page) { openDocumentPreview(current().documents[0], page.page); }
+async function renderPreview() {
+  if (!previewSession || !$('preview-dialog').open) return;
+  const { doc, pages, index, count } = previewSession;
+  const page = pages ? pages[index] : { page: index + 1, rotation: 0 };
+  $('preview-page').value = String(index + 1); $('preview-page').max = String(count);
+  $('preview-count').textContent = `of ${count}`;
+  $('preview-previous').disabled = index === 0; $('preview-next').disabled = index === count - 1;
+  $('preview-page-detail').textContent = pages ? `Original page ${page.page}${page.rotation ? `, rotated ${page.rotation} degrees` : ''}` : '';
+  const host = $('large-preview'); host.textContent = 'Preparing preview...'; host.scrollTop = 0; host.scrollLeft = 0;
+  const width = Math.max(200, host.clientWidth - 44) * Number($('preview-zoom').value);
+  await previews.draw({ host, id: doc.id, page: page.page, rotation: page.rotation, width });
+}
+function movePreview(offset) {
+  if (!previewSession) return;
+  previewSession.index = Math.max(0, Math.min(previewSession.count - 1, previewSession.index + offset));
+  renderPreview();
 }
 async function checkEngine() {
   if (busy) return; busy = true; controls(); $('retry-engine').hidden = true;
@@ -477,7 +512,20 @@ $('move-left').addEventListener('click', () => editPages('earlier')); $('move-ri
 $('undo').addEventListener('click', () => { if (busy || !current().history.length) return; current().pages = current().history.pop(); current().selected.clear(); lastSelected = null; current().result = null; render(); message('Page edit undone.'); });
 $('previous-pages').addEventListener('click', () => { if (busy || !current().pageWindow) return; current().pageWindow -= 1; render(); });
 $('next-pages').addEventListener('click', () => { if (busy || (current().pageWindow + 1) * PAGE_WINDOW >= current().pages.length) return; current().pageWindow += 1; render(); });
-$('close-preview').addEventListener('click', () => $('preview-dialog').close()); $('preview-dialog').addEventListener('close', () => { $('large-preview').previewTicket = null; $('large-preview').replaceChildren(); });
+$('preview-previous').addEventListener('click', () => movePreview(-1));
+$('preview-next').addEventListener('click', () => movePreview(1));
+$('preview-page').addEventListener('change', () => {
+  if (!previewSession) return;
+  const value = Number($('preview-page').value);
+  if (Number.isInteger(value) && value >= 1 && value <= previewSession.count) previewSession.index = value - 1;
+  renderPreview();
+});
+$('preview-zoom').addEventListener('change', renderPreview);
+$('preview-dialog').addEventListener('keydown', (event) => {
+  if (event.target.closest('input, select') || !['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+  event.preventDefault(); movePreview(event.key === 'ArrowLeft' ? -1 : 1);
+});
+$('close-preview').addEventListener('click', () => $('preview-dialog').close()); $('preview-dialog').addEventListener('close', () => { previewSession = null; $('large-preview').previewTicket = null; $('large-preview').replaceChildren(); });
 document.addEventListener('keydown', (event) => {
   const editing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName);
   if (!busy && mode === 'organize' && !$('preview-dialog').open && !editing && event.target.closest('#organizer')) {

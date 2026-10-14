@@ -59,6 +59,7 @@ export class Previews {
       const pdf = await this.pdf(id);
       if (!host.isConnected || generation !== this.generation || host.previewTicket !== ticket) return;
       const pdfPage = await pdf.getPage(page);
+      if (!host.isConnected || generation !== this.generation || host.previewTicket !== ticket) return;
       const angle = (pdfPage.rotate + rotation) % 360;
       const initial = pdfPage.getViewport({ scale: 1, rotation: angle });
       const viewport = pdfPage.getViewport({ scale: width / initial.width, rotation: angle });

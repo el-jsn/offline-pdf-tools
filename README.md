@@ -9,8 +9,10 @@ Documents are never uploaded.
 - Compress individually or in batches: Balanced by default, with lossless and Smallest options.
 - Balanced and Smallest resize and recompress embedded images, including CMYK photographs. Text and vector objects are preserved.
 - See the actual compressed size before saving. Saving uses the measured output.
+- Preview source PDFs in all four tools with page navigation and zoom. Organize previews follow the current page order and rotations.
 - Organize pages with group dragging, edge scrolling, keyboard selection, quick preview, rotation and removal, undo, and moves to a specific position.
 - Split with thumbnail selection, custom page groups, fixed groups, every page, or page split points. Extract selected pages together or separately, combine custom groups, and preview output page lists.
+- Choose System, Light, or Dark appearance in the sidebar.
 - Add files through drag and drop or the file picker.
 
 Original files are preserved. Outputs are saved as new files.

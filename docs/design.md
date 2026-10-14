@@ -13,7 +13,8 @@ there is no marketing page or company branding. The working label is PDF Tools.
 - Narrow sidebar selects the four tools. A compact toolbar has a contextual title,
   file selection, and one primary action. A persistent bottom status area contains
   progress, cancellation, and the saved-file action. The document area scrolls.
-- Single white theme including the native window theme. Native OS window controls,
+- System, Light, and Dark appearances with matching native window themes. PDF
+  paper retains its original colors. Native OS window controls,
   open/save dialogs, and folder selection; no simulated Mac traffic-light buttons.
 - Static SVG icons, visible keyboard focus, reduced motion, descriptive labels,
   keyboard shortcuts, inline errors, and no routine confirmation modals.
