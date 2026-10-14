@@ -60,6 +60,9 @@ existing private update key; it is not committed to this repository. See
 - Signed originals should not be processed: signature preservation is not supported.
 - Page operations may discard bookmarks, attachments, metadata, and accessibility tags.
 
+Warning-only processing results are accepted only after the output passes a separate
+structure, stream, and page-count check. Recovered data is identified in the status.
+
 Lossless compression may produce little reduction. Other presets can reduce image
 quality. A file that cannot be made smaller is saved as an unchanged copy.
 

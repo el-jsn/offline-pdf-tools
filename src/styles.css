@@ -702,3 +702,10 @@ dialog h2 {
   text-align:left;
   font-size:12px;
 }
+
+.compression-size {
+  margin:14px 0 0;
+  color:#1d1d1f;
+  font-size:13px;
+  font-weight:600;
+}

@@ -226,7 +226,7 @@ function compressionSummary() {
     return;
   }
   const saved = measured.inputBytes - measured.outputBytes;
-  host.textContent = saved > 0 ? `Output ${bytes(measured.outputBytes)}, saves ${bytes(saved)}` : `Output ${bytes(measured.outputBytes)}, already optimized`;
+  host.textContent = saved > 0 ? `Expected output: ${bytes(measured.outputBytes)}, saves ${bytes(saved)}` : `Expected output: ${bytes(measured.outputBytes)}, already optimized`;
   host.title = `${measured.outputBytes.toLocaleString()} bytes${measured.files > 1 ? ' total' : ''}`;
 }
 function scheduleCompression() {
@@ -249,7 +249,7 @@ async function measureCompression(key) {
     view.compressionPreview = await invoke('process_documents', {
       request: { jobId, operation: 'compress', ids: view.documents.map((doc) => doc.id), compression: view.compression, measureOnly: true }, onProgress,
     });
-    message('Ready to save');
+    message(view.compressionPreview.recovered ? 'Ready to save. PDF data recovered; review the saved copy.' : 'Ready to save');
   } catch (error) {
     view.measurementFailed = true;
     message(String(error), String(error).startsWith('Cancelled') ? '' : 'error');
@@ -267,6 +267,7 @@ async function save() {
     if (!result) { message('Save cancelled.'); return; } view.result = result;
     let text = activeMode !== 'split' && result.files === 1 ? `Saved ${result.name}. ${bytes(result.outputBytes)}.` : `Saved ${result.files} PDFs in ${result.name}.`;
     if (activeMode === 'compress') text += result.outputBytes < result.inputBytes ? ` ${Math.round((1 - result.outputBytes / result.inputBytes) * 100)}% smaller.` : ' Already optimized. Saved an unchanged copy.';
+    if (result.recovered) text += ' PDF data recovered; review the saved copy.';
     message(text, 'success');
   } catch (error) { message(String(error), String(error).startsWith('Cancelled') ? '' : 'error'); }
   finally { busy = false; jobId = null; cancelAvailable = false; controls(); }
@@ -328,7 +329,7 @@ $('app-update').addEventListener('click', async () => {
       } else message('You have the latest version.');
     }
   } catch (error) {
-    pendingUpdate = null; $('app-update').textContent = 'Check for updates'; message(String(error), 'error');
+    pendingUpdate = null; $('app-update').textContent = 'Check for updates'; message(String(error), String(error).startsWith('No update') ? '' : 'error');
   } finally { busy = false; controls(); scheduleCompression(); }
 });
 $('retry-engine').addEventListener('click', checkEngine);

@@ -48,6 +48,7 @@ struct CompressionPreview {
     outputs: Vec<tempfile::NamedTempFile>,
     digests: Vec<[u8; 32]>,
     sizes: Vec<u64>,
+    recovered: bool,
     // Keep the private directory alive until the cached outputs are released.
     _workspace: tempfile::TempDir,
 }
@@ -67,6 +68,7 @@ struct Saved {
     input_bytes: u64,
     output_bytes: u64,
     file_bytes: Vec<u64>,
+    recovered: bool,
 }
 #[derive(Clone, Serialize)]
 struct Progress {
@@ -233,7 +235,12 @@ fn run(command: &mut Command, cancel: Option<&AtomicBool>) -> Result<(i32, Vec<u
 fn checked(command: &mut Command, cancel: Option<&AtomicBool>) -> Result<Vec<u8>, String> {
     let (code, output) = run(command, cancel)?;
     if code != 0 {
-        return Err("The PDF engine found an error or warning. No output was saved. Try a clean, unencrypted PDF.".into());
+        return Err(if code == 3 {
+            "The PDF could not pass validation. No output was saved."
+        } else {
+            "The PDF engine could not process this file. No output was saved."
+        }
+        .into());
     }
     Ok(output)
 }
@@ -486,6 +493,7 @@ fn record_result(
     files: usize,
     input_bytes: u64,
     output_bytes: u64,
+    recovered: bool,
 ) -> Result<Saved, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let mut results = store
@@ -502,6 +510,7 @@ fn record_result(
         input_bytes,
         output_bytes,
         file_bytes: Vec::new(),
+        recovered,
     };
     results.insert(id, path);
     Ok(saved)
@@ -771,6 +780,7 @@ async fn process_documents(
             } else { None }
         } else { None };
         let mut outputs = Vec::new(); let mut output_bytes = 0u64; let mut sizes = Vec::new();
+        let mut recovered = cached.as_ref().is_some_and(|preview| preview.recovered);
         for index in 0..jobs {
             progress(&on_progress, if jobs == 1 { "Processing the PDF locally...".into() } else { format!("Creating PDF {} of {jobs}...", index + 1) }, true);
             let output = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot create temporary output.")?;
@@ -833,10 +843,17 @@ async fn process_documents(
             config.as_file().sync_all().map_err(|_| "Cannot finish preparing the PDF operation.")?;
             let mut argument = std::ffi::OsString::from("--job-json-file="); argument.push(config.path());
             let mut command = Command::new(&engine); command.arg(argument);
-            checked(&mut command, Some(&cancel))?;
+            // qpdf exit 3 means warnings, not a failed operation. Accept the candidate
+            // only if its independent, strict structure/stream check below succeeds.
+            let (code, _) = run(&mut command, Some(&cancel))?;
+            if ![0, 3].contains(&code) {
+                return Err("The PDF engine could not process this file. No output was saved.".into());
+            }
             progress(&on_progress, format!("Checking output {} of {jobs}...", index + 1), true);
             let mut size = validate_output(&engine, output.path(), expected, &cancel)?;
-            if request.operation == Operation::Compress && size >= documents[index].bytes { copy_into(snapshots[index].path(), output.as_file(), Some(&cancel))?; size = documents[index].bytes; }
+            if request.operation == Operation::Compress && size >= documents[index].bytes {
+                copy_into(snapshots[index].path(), output.as_file(), Some(&cancel))?; size = documents[index].bytes;
+            } else { recovered |= code == 3; }
             output.as_file().sync_all().map_err(|_| "Cannot finish writing the PDF.")?;
             output_bytes += size; sizes.push(size); outputs.push(output);
         }
@@ -845,9 +862,9 @@ async fn process_documents(
             let id = uuid::Uuid::new_v4().to_string();
             let digests = outputs.iter().map(|output| digest(output.path(), Some(&cancel))).collect::<Result<Vec<_>, _>>()?;
             cancelled(Some(&cancel))?;
-            let measured = Saved { id: id.clone(), name: String::new(), files: jobs, input_bytes, output_bytes, file_bytes: sizes.clone() };
+            let measured = Saved { id: id.clone(), name: String::new(), files: jobs, input_bytes, output_bytes, file_bytes: sizes.clone(), recovered };
             *store.compression_preview.lock().map_err(|_| "Compression preview is unavailable.")? = Some(Arc::new(CompressionPreview {
-                id, ids: request.ids, compression: request.compression, outputs, digests, sizes, _workspace: workspace,
+                id, ids: request.ids, compression: request.compression, outputs, digests, sizes, recovered, _workspace: workspace,
             }));
             return Ok(Some(measured));
         }
@@ -865,10 +882,10 @@ async fn process_documents(
                 output.persist_noclobber(&path).map_err(|_| "Cannot save PDFs. No output folder was retained.")?;
             }
             let path = folder.keep();
-            Ok(Some(record_result(&store, path, jobs, input_bytes, output_bytes)?))
+            Ok(Some(record_result(&store, path, jobs, input_bytes, output_bytes, recovered)?))
         } else {
             outputs.pop().ok_or("No PDF was produced.")?.persist_noclobber(&destination).map_err(|_| "Cannot save the PDF. Choose a new filename and a writable folder.")?;
-            Ok(Some(record_result(&store, destination, 1, input_bytes, output_bytes)?))
+            Ok(Some(record_result(&store, destination, 1, input_bytes, output_bytes, recovered)?))
         }
     }).await.map_err(|_| "PDF processing failed.")?
 }
@@ -995,8 +1012,20 @@ async fn check_app_update(
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|_| "Updates are unavailable.")?;
-        let update = tauri::async_runtime::block_on(updater.check())
-            .map_err(|_| "Could not check for updates. Try again later.")?;
+        let update = tauri::async_runtime::block_on(updater.check()).map_err(|error| {
+            match error {
+                tauri_plugin_updater::Error::ReleaseNotFound => "No update release could be found.",
+                tauri_plugin_updater::Error::TargetNotFound(_)
+                | tauri_plugin_updater::Error::TargetsNotFound(_) => {
+                    "No update has been published for this computer."
+                }
+                tauri_plugin_updater::Error::Reqwest(_) => {
+                    "The update service could not be reached. Try again later."
+                }
+                _ => "The update release could not be read. Try again later.",
+            }
+            .to_string()
+        })?;
         if let Some(mut update) = update {
             update.timeout = Some(Duration::from_secs(1200));
             let info = UpdateInfo {
