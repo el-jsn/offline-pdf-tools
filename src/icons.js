@@ -1,4 +1,5 @@
 const shapes = {
+  preview: '<path d="M8 3H3v5M16 3h5v5M3 16v5h5M21 16v5h-5"/>',
   merge: '<rect x="3" y="3" width="12" height="16" rx="2"/><path d="M9 5h10a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H9M7 9h4M7 13h4"/>',
   compress: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="m9 8 3 3 3-3M12 5v6m-3 5 3-3 3 3M12 19v-6"/>',
   split: '<path d="M12 3v7M12 10 5 17m7-7 7 7M3 15v5h5m8 0h5v-5"/>',

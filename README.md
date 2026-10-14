@@ -6,11 +6,11 @@ Documents are never uploaded.
 ## Features
 
 - Merge multiple PDFs in the order you choose.
-- Compress individually or in batches: lossless, Balanced, or Smallest.
+- Compress individually or in batches: Balanced by default, with lossless and Smallest options.
 - Balanced and Smallest resize and recompress embedded images, including CMYK photographs. Text and vector objects are preserved.
 - See the actual compressed size before saving. Saving uses the measured output.
-- Split by page, fixed groups, or custom ranges.
-- Preview, reorder, rotate, and remove pages.
+- Organize pages with group dragging, edge scrolling, keyboard selection, quick preview, rotation and removal, undo, and moves to a specific position.
+- Split with thumbnail selection, custom page groups, fixed groups, every page, or page split points. Extract selected pages together or separately, combine custom groups, and preview output page lists.
 - Add files through drag and drop or the file picker.
 
 Original files are preserved. Outputs are saved as new files.

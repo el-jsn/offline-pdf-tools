@@ -3,7 +3,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { reorderable } from './reorder.js';
 import { icon } from './icons.js';
 import { Previews } from './previews.js';
-import { splitPlan } from './model.js';
+import { splitPlan, parseRange, pageList, movePagesTo, movePagesBeside } from './model.js';
 import './styles.css';
 
 const $ = (id) => document.getElementById(id);
@@ -16,7 +16,7 @@ const tools = {
 };
 const state = Object.fromEntries(Object.keys(tools).map((tool) => [tool, {
   documents: [], pages: [], selected: new Set(), history: [], pageWindow: 0,
-  compressionPreview: null, measurementKey: null, measurementFailed: false, compression: 'lossless', splitMode: 'every_page', groupSize: '5', ranges: '', result: null,
+  compressionPreview: null, measurementKey: null, measurementFailed: false, compression: 'balanced', splitMode: 'selected', groupSize: '5', ranges: '', splitGroups: [''], activeGroup: 0, splitSeparate: false, splitCombine: false, splitCuts: '', result: null,
 }]));
 let mode = 'merge'; let busy = false; let ready = false; let jobId = null; let cancelAvailable = false; let lastSelected = null;
 let compressionTimer = null;
@@ -32,7 +32,7 @@ function validation() {
   if (mode === 'compress') return view.documents.length > 0;
   if (view.documents.length !== 1) return false;
   if (mode === 'organize') return view.pages.length > 0;
-  if (mode === 'split') { try { splitPlan(view.splitMode, view.groupSize, view.ranges, view.documents[0].pages); } catch { return false; } }
+  if (mode === 'split') { try { splitPlanFor(view); } catch { return false; } }
   return true;
 }
 function controls() {
@@ -42,15 +42,20 @@ function controls() {
   $('add').disabled = busy || !ready; $('choose').disabled = busy || !ready;
   $('busy-indicator').hidden = !busy; $('loaded').setAttribute('aria-busy', String(busy));
   $('cancel').hidden = !busy || !cancelAvailable; $('reveal').hidden = busy || !view.result;
-  document.querySelectorAll('.tool, #compression-options input, #split-options input, #split-options select').forEach((control) => { control.disabled = busy; });
+  document.querySelectorAll('.tool, #compression-options input, #split-options input, #split-options select, #split-options button').forEach((control) => { control.disabled = busy; });
+  $('invert-selection').disabled = busy || !view.pages.length;
+  $('add-split-group').disabled = busy || view.splitGroups.length >= 500;
+  $('rotate-left').disabled = busy || !view.selected.size;
+  $('move-page-position').disabled = busy || !view.selected.size; $('move-pages-to').disabled = busy || !view.selected.size;
+  $('move-page-position').max = String(Math.max(1, view.pages.length - view.selected.size + 1));
   $('rotate').disabled = busy || !view.selected.size;
   $('delete-pages').disabled = busy || !view.selected.size || view.selected.size === view.pages.length;
   $('move-left').disabled = busy || !view.pages.some((page, index) => index > 0 && view.selected.has(page.page) && !view.selected.has(view.pages[index - 1].page));
   $('move-right').disabled = busy || !view.pages.some((page, index) => index < view.pages.length - 1 && view.selected.has(page.page) && !view.selected.has(view.pages[index + 1].page));
   $('undo').disabled = busy || !view.history.length; $('select-all').disabled = busy || !view.pages.length;
   $('previous-pages').disabled = busy || view.pageWindow === 0; $('next-pages').disabled = busy || (view.pageWindow + 1) * PAGE_WINDOW >= view.pages.length;
-  for (const control of document.querySelectorAll('.file-actions button')) control.disabled = busy || control.dataset.boundary === 'true';
-  $('save-label').textContent = mode === 'compress' && view.compressionPreview ? (view.documents.length > 1 ? 'Save PDFs' : 'Save PDF') : mode === 'compress' && view.documents.length > 1 ? 'Compress PDFs' : tools[mode].action;
+  for (const control of document.querySelectorAll('.file-actions button, .page-actions button')) control.disabled = busy || control.dataset.boundary === 'true';
+  $('save-label').textContent = mode === 'split' && view.splitMode === 'selected' ? 'Extract pages' : mode === 'compress' && view.compressionPreview ? (view.documents.length > 1 ? 'Save PDFs' : 'Save PDF') : mode === 'compress' && view.documents.length > 1 ? 'Compress PDFs' : tools[mode].action;
   compressionSummary();
   $('add-label').textContent = ['merge', 'compress'].includes(mode) ? 'Add PDFs' : view.documents.length ? 'Replace PDF' : 'Add PDF';
 }
@@ -96,7 +101,8 @@ function updateSelection() {
     const selected = current().selected.has(Number(card.dataset.page)); card.classList.toggle('selected', selected); card.setAttribute('aria-pressed', String(selected));
     card.querySelector('.page-check').replaceChildren(...(selected ? [icon('check')] : []));
   }
-  $('page-selection').textContent = `${current().selected.size} selected`;
+  $('organizer-selection').textContent = mode === 'organize' ? `${current().selected.size} selected` : '';
+  $('page-selection').textContent = mode === 'split' && current().splitMode === 'ranges' ? `Group ${current().activeGroup + 1}: ${current().selected.size} pages selected` : mode === 'split' && current().splitMode === 'after' ? `${current().selected.size} split points` : `${current().selected.size} selected`;
   $('select-all').textContent = current().selected.size === current().pages.length ? 'Deselect all' : 'Select all'; controls();
 }
 function renderPages() {
@@ -105,43 +111,125 @@ function renderPages() {
   const start = view.pageWindow * PAGE_WINDOW;
   view.pages.slice(start, start + PAGE_WINDOW).forEach((page, offset) => {
     const position = start + offset; const card = document.createElement('div'); card.className = 'page-card'; card.tabIndex = 0;
-    card.setAttribute('role', 'button'); card.setAttribute('aria-label', `Output page ${position + 1}, original page ${page.page}. Select, or press Enter to preview.`);
+    card.setAttribute('role', 'button'); card.setAttribute('aria-label', mode === 'split' ? `Page ${page.page}. ${view.splitMode === 'after' ? 'Toggle split point' : 'Select'}. Press Enter to preview.` : `Output page ${position + 1}, original page ${page.page}. Select, or press Enter to preview.`);
     card.dataset.page = String(page.page);
-    reorderable(card, position, card, () => busy, (from, to) => {
-      rememberEdit(); view.pages.splice(to, 0, view.pages.splice(from, 1)[0]); render(); message('Page order updated.');
-    });
+    if (mode === 'organize') reorderable(card, position, card, () => busy, (from, to, after) => {
+      const pages = movePagesBeside(view.pages, view.selected, view.pages[to].page, after);
+      if (pages.map((item) => item.page).join(',') === view.pages.map((item) => item.page).join(',')) return;
+      rememberEdit(); view.pages = pages; render(); message('Page order updated.');
+    }, { onStart: () => {
+      if (!view.selected.has(page.page)) view.selected = new Set([page.page]);
+      updateSelection(); return view.selected.size;
+    } });
     const paper = document.createElement('div'); paper.className = 'page-paper'; previews.watch(paper, view.documents[0].id, page.page, page.rotation);
     const check = document.createElement('span'); check.className = 'page-check'; check.setAttribute('aria-hidden', 'true');
     const caption = document.createElement('span'); caption.className = 'page-caption'; caption.textContent = `Page ${page.page}${page.rotation ? `, rotated ${page.rotation} degrees` : ''}`; card.append(paper, check, caption);
+    if (mode === 'organize') {
+      const actions = document.createElement('div'); actions.className = 'page-actions';
+      const preview = actionButton(`Preview page ${page.page}`, 'preview', () => openPreview(page));
+      const rotate = actionButton(`Rotate page ${page.page}`, 'rotate', () => { if (busy) return; rememberEdit(); page.rotation = (page.rotation + 90) % 360; render(); message('Unsaved changes'); });
+      for (const button of [preview, rotate]) button.addEventListener('click', (event) => event.stopPropagation());
+      actions.addEventListener('dblclick', (event) => event.stopPropagation()); actions.append(preview, rotate); card.append(actions);
+    }
     const select = (event) => {
       if (busy) return;
       if (event.shiftKey && lastSelected !== null) {
         const previous = view.pages.findIndex((item) => item.page === lastSelected);
         if (previous >= 0) for (let index = Math.min(previous, position); index <= Math.max(previous, position); index += 1) view.selected.add(view.pages[index].page);
       } else if (view.selected.has(page.page)) view.selected.delete(page.page); else view.selected.add(page.page);
-      lastSelected = page.page; updateSelection();
+      lastSelected = page.page; if (mode === 'split') writeSplitSelection(); updateSelection();
     };
     card.addEventListener('click', select); card.addEventListener('dblclick', () => openPreview(page));
-    card.addEventListener('keydown', (event) => { if (event.key === ' ') { event.preventDefault(); select(event); } if (event.key === 'Enter') { event.preventDefault(); openPreview(page); } });
+    card.addEventListener('keydown', (event) => {
+      if (event.target !== card) return;
+      const offset = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -getComputedStyle($('page-grid')).gridTemplateColumns.split(' ').length, ArrowDown: getComputedStyle($('page-grid')).gridTemplateColumns.split(' ').length }[event.key];
+      if (offset && !busy) {
+        const nextPosition = Math.max(0, Math.min(view.pages.length - 1, position + offset)); const next = view.pages[nextPosition]; event.preventDefault();
+        if (event.shiftKey) { if (lastSelected === null) lastSelected = page.page; const found = view.pages.findIndex((item) => item.page === lastSelected); const anchor = found < 0 ? position : found; for (let index = Math.min(anchor, nextPosition); index <= Math.max(anchor, nextPosition); index++) view.selected.add(view.pages[index].page); if (mode === 'split') writeSplitSelection(); updateSelection(); }
+        if (Math.floor(nextPosition / PAGE_WINDOW) !== view.pageWindow) { view.pageWindow = Math.floor(nextPosition / PAGE_WINDOW); render(); }
+        $('page-grid').querySelector(`[data-page="${next.page}"]`)?.focus(); return;
+      }
+      if (event.key === ' ') { event.preventDefault(); select(event); } if (event.key === 'Enter') { event.preventDefault(); openPreview(page); } });
     $('page-grid').append(card);
   });
   $('page-window').textContent = view.pages.length ? `${start + 1}-${Math.min(start + PAGE_WINDOW, view.pages.length)} of ${view.pages.length}` : 'No pages'; updateSelection();
 }
+function splitPlanFor(view) {
+  const ranges = view.splitMode === 'ranges' ? view.splitGroups.join(';') : view.splitMode === 'after' ? view.splitCuts : view.ranges;
+  const plan = splitPlan(view.splitMode, view.groupSize, ranges, view.documents[0].pages, { separate: view.splitSeparate, combine: view.splitCombine });
+  if (plan.map(pageList).join(';').length > 20000) throw new Error('The page range list is too long.');
+  return plan;
+}
+function readSplitSelection() {
+  const view = current();
+  const text = view.splitMode === 'ranges' ? view.splitGroups[view.activeGroup] : view.splitMode === 'after' ? view.splitCuts : view.ranges;
+  try { view.selected = new Set(parseRange(text, view.documents[0].pages)); } catch { view.selected.clear(); }
+}
+function writeSplitSelection() {
+  const view = current(); const text = pageList([...view.selected].sort((a, b) => a - b)); view.result = null;
+  if (view.splitMode === 'ranges') {
+    view.splitGroups[view.activeGroup] = text;
+    $('split-group-list').querySelectorAll('input')[view.activeGroup].value = text;
+  } else if (view.splitMode === 'after') { view.splitCuts = text; $('split-cuts').value = text; }
+  else { view.ranges = text; $('split-ranges').value = text; }
+  splitSummary();
+}
+function renderSplitGroups() {
+  const view = current(); $('split-group-list').replaceChildren();
+  view.splitGroups.forEach((value, index) => {
+    const row = document.createElement('div'); row.className = 'split-group'; row.classList.toggle('active', index === view.activeGroup);
+    const label = document.createElement('label'); label.htmlFor = `split-group-${index}`; label.textContent = `Group ${index + 1}`;
+    const input = document.createElement('input'); input.type = 'text'; input.id = label.htmlFor; input.value = value; input.placeholder = '1-3, 5, 8'; input.autocomplete = 'off'; input.spellcheck = false;
+    const activate = () => {
+      if (busy) return;
+      view.activeGroup = index; lastSelected = null;
+      for (const [position, item] of [...$('split-group-list').children].entries()) item.classList.toggle('active', position === index);
+      readSplitSelection(); updateSelection();
+    };
+    input.addEventListener('focus', activate);
+    input.addEventListener('input', () => { view.splitGroups[index] = input.value; view.result = null; readSplitSelection(); splitSummary(); updateSelection(); });
+    const select = document.createElement('button'); select.className = 'secondary'; select.textContent = 'Choose pages'; select.addEventListener('click', activate);
+    const actions = document.createElement('div'); actions.className = 'file-actions';
+    const move = (offset) => { if (busy) return; view.splitGroups.splice(index + offset, 0, view.splitGroups.splice(index, 1)[0]); view.activeGroup = index + offset; view.result = null; lastSelected = null; render(); };
+    actions.append(actionButton(`Move group ${index + 1} earlier`, 'up', () => move(-1), index === 0), actionButton(`Move group ${index + 1} later`, 'down', () => move(1), index === view.splitGroups.length - 1));
+    actions.append(actionButton(`Remove group ${index + 1}`, 'trash', () => { if (busy) return; view.splitGroups.splice(index, 1); view.activeGroup = Math.min(view.activeGroup, view.splitGroups.length - 1); view.result = null; lastSelected = null; render(); }, view.splitGroups.length === 1));
+    row.append(label, input, select, actions); $('split-group-list').append(row);
+  });
+}
 function splitSummary() {
   if (!current().documents.length) return;
+  const view = current(); $('split-output-list').replaceChildren();
+  for (const input of $('split-options').querySelectorAll('input')) input.removeAttribute('aria-invalid');
   try {
-    const plan = splitPlan(current().splitMode, current().groupSize, current().ranges, current().documents[0].pages);
-    $('split-summary').textContent = `${plan.length} ${plan.length === 1 ? 'PDF' : 'PDFs'} in a new folder.`;
-    $('split-summary').className = 'context-note'; $('split-ranges').removeAttribute('aria-invalid');
-  } catch (error) { $('split-summary').textContent = error.message; $('split-summary').className = 'context-note invalid'; $('split-ranges').setAttribute('aria-invalid', 'true'); }
+    const plan = splitPlanFor(view); const used = new Set(plan.flat()).size;
+    $('split-summary').textContent = `${plan.length} ${plan.length === 1 ? 'PDF' : 'PDFs'}, ${plan.flat().length} output pages${used < view.documents[0].pages ? `, ${view.documents[0].pages - used} pages excluded` : ''}.`;
+    $('split-summary').className = 'context-note'; $('split-output-details').hidden = false;
+    plan.slice(0, 20).forEach((pages, index) => {
+      const item = document.createElement('li'); item.textContent = `PDF ${index + 1}: ${pages.length} ${pages.length === 1 ? 'page' : 'pages'} (${pageList(pages)})`; $('split-output-list').append(item);
+    });
+    if (plan.length > 20) { const item = document.createElement('li'); item.textContent = `${plan.length - 20} more PDFs`; $('split-output-list').append(item); }
+  } catch (error) {
+    $('split-summary').textContent = error.message; $('split-summary').className = 'context-note invalid'; $('split-output-details').hidden = true;
+    if (view.splitMode === 'ranges') view.splitGroups.forEach((range, index) => { try { parseRange(range, view.documents[0].pages); } catch { $('split-group-list').querySelectorAll('input')[index].setAttribute('aria-invalid', 'true'); } });
+    else $(view.splitMode === 'after' ? 'split-cuts' : view.splitMode === 'groups' ? 'group-size' : 'split-ranges').setAttribute('aria-invalid', 'true');
+  }
   controls();
 }
 function render() {
+  const previousCards = mode === 'organize' ? new Map([...$('page-grid').children].map((card) => [card.dataset.page, card.getBoundingClientRect()])) : new Map();
   previews.resetView(); const view = current(); const hasDocuments = view.documents.length > 0;
   $('empty').hidden = hasDocuments; $('loaded').hidden = !hasDocuments;
-  $('compression-options').hidden = mode !== 'compress'; $('split-options').hidden = mode !== 'split'; $('organizer').hidden = mode !== 'organize';
-  $('group-row').hidden = view.splitMode !== 'groups'; $('range-row').hidden = view.splitMode !== 'ranges'; renderDocuments();
-  if (mode === 'organize' && hasDocuments) renderPages(); if (mode === 'split' && hasDocuments) splitSummary();
+  $('compression-options').hidden = mode !== 'compress'; $('split-options').hidden = mode !== 'split'; $('organizer').hidden = mode !== 'organize' && !(mode === 'split' && ['selected', 'ranges', 'after'].includes(view.splitMode));
+  $('organizer-edits').hidden = mode !== 'organize'; $('move-pages-controls').hidden = mode !== 'organize'; $('organizer-selection').hidden = mode !== 'organize'; $('undo').hidden = mode !== 'organize'; $('invert-selection').hidden = mode !== 'split';
+  $('page-grid').classList.toggle('split-pages', mode === 'split'); $('page-grid').setAttribute('aria-label', mode === 'split' ? 'Source pages' : 'Pages in output order');
+  $('organizer-tools').parentElement.setAttribute('aria-label', mode === 'split' ? 'Select pages for splitting' : 'Organize selected pages');
+  $('group-row').hidden = view.splitMode !== 'groups'; $('range-row').hidden = view.splitMode !== 'ranges'; $('selection-row').hidden = view.splitMode !== 'selected'; $('cut-row').hidden = view.splitMode !== 'after'; renderDocuments();
+  if (mode === 'split' && hasDocuments) { renderSplitGroups(); readSplitSelection(); }
+  if (!$('organizer').hidden && hasDocuments) renderPages(); if (mode === 'split' && hasDocuments) splitSummary();
+  if (mode === 'organize' && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) for (const card of $('page-grid').children) {
+    const before = previousCards.get(card.dataset.page); if (!before) continue; const after = card.getBoundingClientRect();
+    if (before.x !== after.x || before.y !== after.y) card.animate([{ transform: `translate(${before.x - after.x}px, ${before.y - after.y}px)` }, { transform: 'translate(0, 0)' }], { duration: 200, easing: 'cubic-bezier(.2,.8,.2,1)' });
+  }
   const total = view.documents.reduce((sum, doc) => sum + doc.bytes, 0);
   const pages = mode === 'organize' ? view.pages.length : view.documents.reduce((sum, doc) => sum + doc.pages, 0);
   $('summary').textContent = hasDocuments ? `${view.documents.length} ${view.documents.length === 1 ? 'document' : 'documents'}, ${pages} pages, ${bytes(total)}` : 'No PDFs selected';
@@ -172,8 +260,9 @@ async function acceptSelection(selected, insertionIndex) {
     }
   } else {
     view.documents = selected;
-    view.pages = mode === 'organize' ? Array.from({ length: selected[0].pages }, (_, index) => ({ page: index + 1, rotation: 0 })) : [];
+    view.pages = ['organize', 'split'].includes(mode) ? Array.from({ length: selected[0].pages }, (_, index) => ({ page: index + 1, rotation: 0 })) : [];
     view.selected.clear(); view.history = []; view.pageWindow = 0; lastSelected = null;
+    if (mode === 'split') { view.ranges = ''; view.splitGroups = ['']; view.activeGroup = 0; view.splitCuts = ''; $('split-ranges').value = ''; $('split-cuts').value = ''; }
   }
   view.result = null;
   for (const doc of selected) await previews.forget(doc.id);
@@ -263,7 +352,8 @@ async function save() {
   const onProgress = new Channel(); onProgress.onmessage = (progress) => { message(progress.message); cancelAvailable = progress.cancellable; controls(); };
   controls(); message(mode === 'split' || (mode === 'compress' && view.documents.length > 1) ? 'Select output folder' : 'Select save location');
   try {
-    const result = await invoke('process_documents', { request: { jobId, operation: mode, ids: view.documents.map((doc) => doc.id), compression: view.compression, previewId: view.compressionPreview?.id ?? null, splitMode: view.splitMode, pagesPerFile: Number(view.groupSize), ranges: view.ranges, pages: view.pages }, onProgress });
+    const splitRanges = mode === 'split' ? splitPlanFor(view).map(pageList).join(';') : view.ranges;
+    const result = await invoke('process_documents', { request: { jobId, operation: mode, ids: view.documents.map((doc) => doc.id), compression: view.compression, previewId: view.compressionPreview?.id ?? null, splitMode: mode === 'split' ? 'ranges' : 'every_page', pagesPerFile: Number(view.groupSize), ranges: splitRanges, pages: view.pages }, onProgress });
     if (!result) { message('Save cancelled.'); return; } view.result = result;
     let text = activeMode !== 'split' && result.files === 1 ? `Saved ${result.name}. ${bytes(result.outputBytes)}.` : `Saved ${result.files} PDFs in ${result.name}.`;
     if (activeMode === 'compress') text += result.outputBytes < result.inputBytes ? ` ${Math.round((1 - result.outputBytes / result.inputBytes) * 100)}% smaller.` : ' Already optimized. Saved an unchanged copy.';
@@ -275,8 +365,8 @@ async function save() {
 function editPages(action) {
   if (busy || !current().selected.size || (action === 'remove' && current().selected.size === current().pages.length)) return;
   const view = current(); rememberEdit();
-  if (action === 'rotate') view.pages = view.pages.map((page) => view.selected.has(page.page) ? { ...page, rotation: (page.rotation + 90) % 360 } : page);
-  if (action === 'remove') { view.pages = view.pages.filter((page) => !view.selected.has(page.page)); view.selected.clear(); }
+  if (action === 'rotate' || action === 'rotate-left') view.pages = view.pages.map((page) => view.selected.has(page.page) ? { ...page, rotation: (page.rotation + (action === 'rotate-left' ? 270 : 90)) % 360 } : page);
+  if (action === 'remove') { view.pages = view.pages.filter((page) => !view.selected.has(page.page)); view.selected.clear(); lastSelected = null; }
   if (action === 'earlier') for (let index = 1; index < view.pages.length; index += 1) { if (view.selected.has(view.pages[index].page) && !view.selected.has(view.pages[index - 1].page)) [view.pages[index - 1], view.pages[index]] = [view.pages[index], view.pages[index - 1]]; }
   if (action === 'later') for (let index = view.pages.length - 2; index >= 0; index -= 1) { if (view.selected.has(view.pages[index].page) && !view.selected.has(view.pages[index + 1].page)) [view.pages[index + 1], view.pages[index]] = [view.pages[index], view.pages[index + 1]]; }
   render(); message('Unsaved changes');
@@ -297,7 +387,7 @@ function setMode(next) {
   document.title = tool.heading; invoke('set_view_title', { tool: mode }).catch(() => {}); $('heading').textContent = tool.heading; $('save-label').textContent = tool.action;
   $('choose-label').textContent = ['merge', 'compress'].includes(mode) ? 'Choose PDFs' : 'Choose a PDF'; 
   $('list-label').textContent = ['merge', 'compress'].includes(mode) ? 'Documents' : 'Document';
-  $('split-mode').value = current().splitMode; $('group-size').value = current().groupSize; $('split-ranges').value = current().ranges;
+  $('split-mode').value = current().splitMode; $('group-size').value = current().groupSize; $('split-ranges').value = current().ranges; $('split-cuts').value = current().splitCuts; $('split-separate').checked = current().splitSeparate; $('split-combine').checked = current().splitCombine;
   for (const input of document.querySelectorAll('input[name="compression"]')) input.checked = input.value === current().compression;
   $('quality-note').hidden = current().compression === 'lossless';
   for (const button of document.querySelectorAll('.tool')) { button.classList.toggle('active', button.dataset.mode === mode); button.setAttribute('aria-pressed', String(button.dataset.mode === mode)); }
@@ -345,17 +435,32 @@ $('toggle-sidebar').addEventListener('click', () => {
   $('toggle-sidebar').setAttribute('aria-label', hidden ? 'Show sidebar' : 'Hide sidebar'); $('toggle-sidebar').title = hidden ? 'Show sidebar' : 'Hide sidebar';
 });
 for (const input of document.querySelectorAll('input[name="compression"]')) input.addEventListener('change', () => { invalidateCompression(); current().compression = input.value; $('quality-note').hidden = input.value === 'lossless'; current().result = null; render(); });
-$('split-mode').addEventListener('change', () => { current().splitMode = $('split-mode').value; current().result = null; render(); });
+$('split-mode').addEventListener('change', () => { current().splitMode = $('split-mode').value; current().result = null; lastSelected = null; render(); });
 $('group-size').addEventListener('input', () => { current().groupSize = $('group-size').value; current().result = null; splitSummary(); });
-$('split-ranges').addEventListener('input', () => { current().ranges = $('split-ranges').value; current().result = null; splitSummary(); });
-$('select-all').addEventListener('click', () => { if (busy) return; const view = current(); view.selected = view.selected.size === view.pages.length ? new Set() : new Set(view.pages.map((page) => page.page)); updateSelection(); });
+$('split-ranges').addEventListener('input', () => { current().ranges = $('split-ranges').value; current().result = null; readSplitSelection(); splitSummary(); updateSelection(); });
+$('split-cuts').addEventListener('input', () => { current().splitCuts = $('split-cuts').value; current().result = null; readSplitSelection(); splitSummary(); updateSelection(); });
+$('split-separate').addEventListener('change', () => { current().splitSeparate = $('split-separate').checked; current().result = null; splitSummary(); });
+$('split-combine').addEventListener('change', () => { current().splitCombine = $('split-combine').checked; current().result = null; splitSummary(); });
+$('add-split-group').addEventListener('click', () => { if (busy || current().splitGroups.length >= 500) return; const view = current(); view.splitGroups.push(''); view.activeGroup = view.splitGroups.length - 1; view.result = null; lastSelected = null; render(); $(`split-group-${view.activeGroup}`).focus(); });
+$('invert-selection').addEventListener('click', () => { if (busy) return; const view = current(); view.selected = new Set(view.pages.filter((page) => !view.selected.has(page.page)).map((page) => page.page)); lastSelected = null; writeSplitSelection(); updateSelection(); });
+$('select-all').addEventListener('click', () => { if (busy) return; const view = current(); view.selected = view.selected.size === view.pages.length ? new Set() : new Set(view.pages.map((page) => page.page)); lastSelected = null; if (mode === 'split') writeSplitSelection(); updateSelection(); });
+$('rotate-left').addEventListener('click', () => editPages('rotate-left'));
+$('move-pages-to').addEventListener('click', () => {
+  if (busy || !current().selected.size) return;
+  try { const pages = movePagesTo(current().pages, current().selected, Number($('move-page-position').value)); rememberEdit(); current().pages = pages; current().pageWindow = Math.floor((Number($('move-page-position').value) - 1) / PAGE_WINDOW); render(); $('page-grid').querySelector('.selected')?.focus(); message('Page order updated.'); } catch (error) { message(error.message, 'error'); }
+});
 $('rotate').addEventListener('click', () => editPages('rotate')); $('delete-pages').addEventListener('click', () => editPages('remove'));
 $('move-left').addEventListener('click', () => editPages('earlier')); $('move-right').addEventListener('click', () => editPages('later'));
-$('undo').addEventListener('click', () => { if (busy || !current().history.length) return; current().pages = current().history.pop(); current().selected.clear(); current().result = null; render(); message('Page edit undone.'); });
+$('undo').addEventListener('click', () => { if (busy || !current().history.length) return; current().pages = current().history.pop(); current().selected.clear(); lastSelected = null; current().result = null; render(); message('Page edit undone.'); });
 $('previous-pages').addEventListener('click', () => { if (busy || !current().pageWindow) return; current().pageWindow -= 1; render(); });
 $('next-pages').addEventListener('click', () => { if (busy || (current().pageWindow + 1) * PAGE_WINDOW >= current().pages.length) return; current().pageWindow += 1; render(); });
 $('close-preview').addEventListener('click', () => $('preview-dialog').close()); $('preview-dialog').addEventListener('close', () => { $('large-preview').previewTicket = null; $('large-preview').replaceChildren(); });
 document.addEventListener('keydown', (event) => {
+  const editing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName);
+  if (!busy && mode === 'organize' && !$('preview-dialog').open && !editing && event.target.closest('#organizer')) {
+    if (['Backspace', 'Delete'].includes(event.key)) { event.preventDefault(); if (!$('delete-pages').disabled) editPages('remove'); return; }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a') { event.preventDefault(); current().selected = new Set(current().pages.map((page) => page.page)); updateSelection(); return; }
+  }
   if (!(event.metaKey || event.ctrlKey) || busy || $('preview-dialog').open) return;
   if (event.key.toLowerCase() === 'o') { event.preventDefault(); choose(); }
   if (event.key.toLowerCase() === 's') { event.preventDefault(); save(); }
