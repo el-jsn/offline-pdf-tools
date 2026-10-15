@@ -19,14 +19,52 @@ struct Config {
     patch: PathBuf,
     directory: PathBuf,
     preset: String,
-    #[serde(default)] quality: Option<u8>,
-    #[serde(default)] dpi: Option<u32>,
+    #[serde(default)]
+    quality: Option<u8>,
+    #[serde(default)]
+    dpi: Option<u32>,
 }
 #[derive(Clone)]
 struct Candidate {
     key: String,
     dict: Value,
     bytes: u64,
+}
+fn display_size(a: f64, b: f64, c: f64, d: f64) -> Option<(f64, f64)> {
+    let width = a.hypot(b);
+    let height = c.hypot(d);
+    (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+        .then_some((width, height))
+}
+fn largest_placement(first: Option<(f64, f64)>, next: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    match (first, next) {
+        (Some((w, h)), Some((nw, nh))) => Some((w.max(nw), h.max(nh))),
+        _ => None,
+    }
+}
+fn target_dimensions(
+    width: u32,
+    height: u32,
+    display_width: f64,
+    display_height: f64,
+    dpi: u32,
+) -> (u32, u32) {
+    let scale = ((display_width * dpi as f64 / 72.0) / width as f64)
+        .max((display_height * dpi as f64 / 72.0) / height as f64)
+        .min(1.0);
+    (
+        ((width as f64 * scale).ceil() as u32).clamp(1, width),
+        ((height as f64 * scale).ceil() as u32).clamp(1, height),
+    )
+}
+fn standard_page_units(objects: &serde_json::Map<String, Value>) -> bool {
+    objects.values().all(|object| {
+        let dict = &object["value"];
+        dict["/Type"] != "/Page"
+            || dict
+                .get("/UserUnit")
+                .is_none_or(|unit| unit.as_f64() == Some(1.0))
+    })
 }
 struct Optimizer<'a> {
     directory: &'a Path,
@@ -36,17 +74,43 @@ struct Optimizer<'a> {
     quality: u8,
     dpi: u32,
     examined: usize,
-    uses: HashMap<[u8; 32], usize>,
+    placements: HashMap<[u8; 32], Option<(f64, f64)>>,
 }
 impl Optimizer<'_> {
-    fn count_uses(&mut self, object: PdfPageObject<'_>, depth: usize) -> Result<(), String> {
-        if depth > 16 || self.examined > 200000 { return Err("This PDF is too complex for image compression.".into()); }
+    fn collect_placements(
+        &mut self,
+        object: PdfPageObject<'_>,
+        depth: usize,
+    ) -> Result<(), String> {
+        if depth > 16 || self.examined > 200000 {
+            return Err("This PDF is too complex for image compression.".into());
+        }
         self.examined += 1;
         if let Some(form) = object.as_x_object_form_object() {
-            for child in form.iter() { self.count_uses(child, depth + 1)?; }
+            for child in form.iter() {
+                self.collect_placements(child, depth + 1)?;
+            }
         } else if let Some(image) = object.as_image_object() {
             if let Ok(raw) = image.get_raw_image_data() {
-                if raw.len() <= 32 * 1024 * 1024 { let hash: [u8; 32] = Sha256::digest(&raw).into(); *self.uses.entry(hash).or_default() += 1; }
+                if raw.len() <= 32 * 1024 * 1024 {
+                    let hash: [u8; 32] = Sha256::digest(&raw).into();
+                    let size = if depth == 0 {
+                        image.matrix().ok().and_then(|matrix| {
+                            display_size(
+                                matrix.a() as f64,
+                                matrix.b() as f64,
+                                matrix.c() as f64,
+                                matrix.d() as f64,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    self.placements
+                        .entry(hash)
+                        .and_modify(|existing| *existing = largest_placement(*existing, size))
+                        .or_insert(size);
+                }
             }
         }
         Ok(())
@@ -97,6 +161,22 @@ impl Optimizer<'_> {
             {
                 return Ok(());
             }
+            // Every direct placement must be understood before changing a shared stream.
+            // Nested form transforms and ambiguous stream identities remain unchanged.
+            if depth > 0 || candidates.len() != 1 {
+                return Ok(());
+            }
+            let Some(Some((display_width, display_height))) = self.placements.get(&hash).copied()
+            else {
+                return Ok(());
+            };
+            let (target_width, target_height) = target_dimensions(
+                width as u32,
+                height as u32,
+                display_width,
+                display_height,
+                self.dpi,
+            );
             let Ok(decoded) = image.get_raw_image() else {
                 return Ok(());
             };
@@ -108,17 +188,6 @@ impl Optimizer<'_> {
                     return Ok(());
                 }
             }
-            // Nested form transforms and reused images may have different physical sizes.
-            // Preserve those images rather than guessing the lowest safe resolution.
-            if depth > 0 || candidates.len() != 1 || self.uses.get(&hash).copied().unwrap_or(0) != 1 { return Ok(()); }
-            let Ok(bounds) = object.bounds() else { return Ok(()); };
-            let display_width = bounds.width().value.abs() as f64;
-            let display_height = bounds.height().value.abs() as f64;
-            if display_width <= 0.0 || display_height <= 0.0 { return Ok(()); }
-            let scale = ((display_width * self.dpi as f64 / 72.0) / width as f64)
-                .max((display_height * self.dpi as f64 / 72.0) / height as f64).min(1.0);
-            let target_width = ((width as f64 * scale).round() as u32).max(1);
-            let target_height = ((height as f64 * scale).round() as u32).max(1);
             let resized = decoded
                 .resize_exact(target_width, target_height, FilterType::Lanczos3)
                 .to_rgb8();
@@ -240,13 +309,21 @@ fn process(config: Config) -> Result<usize, String> {
         quality: config.quality.unwrap_or(quality),
         dpi: config.dpi.unwrap_or(dpi),
         examined: 0,
-        uses: HashMap::new(),
+        placements: HashMap::new(),
     };
-    for page in document.pages().iter() { for object in page.objects().iter() { optimizer.count_uses(object, 0)?; } }
-    optimizer.examined = 0;
-    for page in document.pages().iter() {
-        for object in page.objects().iter() {
-            optimizer.visit(object, 0)?;
+    // Unusual page units need a physical scale not exposed by the image matrix.
+    // Preserve these images until every placement's scale can be established.
+    if standard_page_units(objects) {
+        for page in document.pages().iter() {
+            for object in page.objects().iter() {
+                optimizer.collect_placements(object, 0)?;
+            }
+        }
+        optimizer.examined = 0;
+        for page in document.pages().iter() {
+            for object in page.objects().iter() {
+                optimizer.visit(object, 0)?;
+            }
         }
     }
     let count = optimizer.replacements.len();
@@ -282,5 +359,45 @@ fn main() {
             eprintln!("{message}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    #[test]
+    fn shared_images_use_largest_width_and_height_without_upscaling() {
+        let size = largest_placement(Some((72.0, 144.0)), Some((288.0, 72.0))).unwrap();
+        assert_eq!(
+            target_dimensions(2400, 2400, size.0, size.1, 240),
+            (960, 960)
+        );
+        assert_eq!(target_dimensions(300, 300, size.0, size.1, 240), (300, 300));
+    }
+    #[test]
+    fn rotation_preserves_physical_axis_lengths() {
+        let straight = display_size(288.0, 0.0, 0.0, 144.0).unwrap();
+        let rotated = display_size(0.0, 288.0, -144.0, 0.0).unwrap();
+        assert_eq!(straight, rotated);
+        assert_eq!(
+            target_dimensions(2400, 1200, rotated.0, rotated.1, 240),
+            (960, 480)
+        );
+    }
+    #[test]
+    fn one_unknown_placement_keeps_the_shared_image_unchanged() {
+        assert_eq!(largest_placement(Some((100.0, 100.0)), None), None);
+        assert_eq!(largest_placement(None, Some((100.0, 100.0))), None);
+        assert_eq!(display_size(f64::NAN, 0.0, 0.0, 100.0), None);
+        assert_eq!(display_size(0.0, 0.0, 0.0, 100.0), None);
+    }
+    #[test]
+    fn nonstandard_or_unknown_page_units_preserve_images() {
+        for unit in [json!(2), json!(0), json!("9 0 R"), Value::Null] {
+            let objects = json!({ "obj:1 0 R": {"value": {"/Type":"/Page", "/UserUnit":unit}} });
+            assert!(!standard_page_units(objects.as_object().unwrap()));
+        }
+        let objects = json!({ "obj:1 0 R": {"value": {"/Type":"/Page"}}, "obj:2 0 R": {"value": {"/Type":"/Page", "/UserUnit":1}} });
+        assert!(standard_page_units(objects.as_object().unwrap()));
     }
 }

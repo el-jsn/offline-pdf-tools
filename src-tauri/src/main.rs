@@ -713,7 +713,7 @@ fn preserve_navigation(engine: &Path, output: &tempfile::NamedTempFile, document
     serde_json::to_writer(patch.as_file(), &serde_json::json!({"qpdf":[{"jsonversion":2},changes]})).map_err(|_| "Cannot preserve navigation.")?;
     let candidate=tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace).map_err(|_| "Cannot preserve navigation.")?;
     let mut argument=std::ffi::OsString::from("--update-from-json="); argument.push(patch.path());
-    checked(Command::new(engine).arg(argument).arg(output.path()).arg(candidate.path()),Some(cancel))?;
+    checked(Command::new(engine).arg(argument).arg("--object-streams=generate").arg(output.path()).arg(candidate.path()),Some(cancel))?;
     validate_output(engine,candidate.path(),layout.len(),cancel)?;
     copy_into(candidate.path(),output.as_file(),Some(cancel))
 }
@@ -982,7 +982,7 @@ fn make_size_part(engine: &Path, input: &Path, documents: &[Selected], first: u3
     cancelled(Some(cancel))?;
     let output = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace).map_err(|_| "Cannot create temporary output.")?;
     let path_text = |path: &Path| path.to_str().map(str::to_owned).ok_or_else(|| "Choose a folder with a valid Unicode name.".to_owned());
-    let job = serde_json::json!({ "inputFile": path_text(input)?, "outputFile": path_text(output.path())?, "pages": [{ "file": path_text(input)?, "range": format!("{first}-{last}") }] });
+    let job = serde_json::json!({ "inputFile": path_text(input)?, "outputFile": path_text(output.path())?, "removeUnreferencedResources": "yes", "objectStreams": "generate", "pages": [{ "file": path_text(input)?, "range": format!("{first}-{last}") }] });
     let config = tempfile::Builder::new().suffix(".json").tempfile_in(workspace).map_err(|_| "Cannot prepare the PDF operation.")?;
     serde_json::to_writer(config.as_file(), &job).map_err(|_| "Cannot prepare the PDF operation.")?;
     let mut argument = std::ffi::OsString::from("--job-json-file="); argument.push(config.path());
@@ -1129,7 +1129,8 @@ async fn process_documents(
                 path.to_str().map(str::to_owned).ok_or_else(|| "Choose an output folder with a valid Unicode name.".into())
             };
             // QPDFJob JSON avoids Windows command-length limits for large page plans.
-            let mut job = serde_json::json!({ "outputFile": path_text(output.path())? });
+            // Drop unused page resources and pack structural objects without changing content.
+            let mut job = serde_json::json!({ "outputFile": path_text(output.path())?, "removeUnreferencedResources": "yes", "objectStreams": "generate" });
             let expected = match request.operation {
                 Operation::Merge | Operation::Organize => {
                     job["inputFile"] = path_text(snapshots[0].path())?.into();
@@ -1147,7 +1148,6 @@ async fn process_documents(
                     job["compressStreams"] = "y".into();
                     job["recompressFlate"] = "".into();
                     job["compressionLevel"] = "9".into();
-                    job["objectStreams"] = "generate".into();
                     documents[index].pages as usize
                 }
                 Operation::Split => {
