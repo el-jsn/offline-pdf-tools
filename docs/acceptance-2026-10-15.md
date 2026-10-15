@@ -39,4 +39,4 @@ The ordinary Tauri DMG packaging attempt initially failed inside the filesystem 
 - Confirm installation and updating on the company's actual supported macOS versions. M1 through M4 architecture compatibility does not establish those runtime results.
 - Have an agent review Compare on representative documents, including scanned pages and form values that its text comparison deliberately excludes.
 
-No version bump, GitHub publication, or installed production-app replacement was performed.
+This acceptance pass did not bump or publish a version or replace the installed production app. IT subsequently authorized the 1.0.0 release; its notes are in [release-notes/1.0.0.md](release-notes/1.0.0.md). The pilot checks above remain unverified.
