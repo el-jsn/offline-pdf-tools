@@ -3,6 +3,8 @@ import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/legacy/build/pdf.mj
 import workerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 GlobalWorkerOptions.workerSrc = workerUrl;
 
+const CHUNK = 1024 * 1024;
+
 export class Previews {
   constructor() {
     this.cache = new Map(); this.queue = []; this.active = 0; this.generation = 0; this.renders = new Set(); this.activeIds = new Map();
@@ -20,49 +22,67 @@ export class Previews {
     for (const task of this.renders) task.cancel();
     this.renders.clear();
   }
-  async forget(id) {
-    const entry = this.cache.get(id); this.cache.delete(id);
+  async forget(key) {
+    const entry = this.cache.get(key); this.cache.delete(key);
     if (entry) {
       try { await entry.promise; } catch { /* Failed loading tasks can still be destroyed. */ }
       await entry.task?.destroy();
     }
   }
-  watch(host, id, page = 1, rotation = 0) {
-    host.previewSpec = { id, page, rotation, width: 150 }; this.observer.observe(host);
+  watch(host, id, page = 1, rotation = 0, bytes = 0) {
+    host.previewSpec = { id, page, rotation, width: 150, bytes }; this.observer.observe(host);
   }
-  async pdf(id) {
-    if (this.cache.has(id)) return this.cache.get(id).promise;
+  key(spec) { return spec.previewId ? `preview:${spec.previewId}:${spec.outputIndex ?? 0}` : spec.id; }
+  async readSource(spec) {
+    const total = Math.max(0, Number(spec.bytes) || 0);
+    const parts = [];
+    for (let begin = 0; begin < total; begin += CHUNK) {
+      const end = Math.min(begin + CHUNK, total);
+      const chunk = await invoke('read_document_range', { id: spec.id || '', begin, end, previewId: spec.previewId || null, outputIndex: spec.outputIndex ?? null });
+      parts.push(new Uint8Array(chunk));
+    }
+    const data = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) { data.set(part, offset); offset += part.length; }
+    return data;
+  }
+  async pdf(spec) {
+    const key = this.key(spec);
+    if (this.cache.has(key)) return this.cache.get(key).promise;
     // Bound decoded-document retention; canvases already drawn remain usable.
     if (this.cache.size >= 3) {
-      const oldest = [...this.cache.keys()].find((key) => !this.activeIds.has(key));
+      const oldest = [...this.cache.keys()].find((candidate) => !this.activeIds.has(candidate));
       if (oldest !== undefined) await this.forget(oldest);
     }
-    if (this.cache.has(id)) return this.cache.get(id).promise;
-    const entry = {}; this.cache.set(id, entry);
+    if (this.cache.has(key)) return this.cache.get(key).promise;
+    const entry = {}; this.cache.set(key, entry);
     entry.promise = (async () => {
-      const buffer = await invoke('read_document', { id });
+      const data = await this.readSource(spec);
       const assets = new URL('/pdfjs/', window.location.href).href;
       entry.task = getDocument({
-        data: new Uint8Array(buffer), isEvalSupported: false, verbosity: 0,
+        data, isEvalSupported: false, verbosity: 0,
         cMapUrl: `${assets}cmaps/`, cMapPacked: true, iccUrl: `${assets}iccs/`,
         standardFontDataUrl: `${assets}standard_fonts/`, wasmUrl: `${assets}wasm/`,
         useSystemFonts: true, enableXfa: false,
       });
       return entry.task.promise;
     })();
-    try { return await entry.promise; } catch (error) { this.cache.delete(id); throw error; }
+    try { return await entry.promise; } catch (error) { this.cache.delete(key); throw error; }
   }
-  async draw({ host, id, page, rotation = 0, width = 150, generation = this.generation }) {
+  async draw({ host, generation = this.generation, ...spec }) {
     const ticket = Symbol(); host.previewTicket = ticket;
-    this.activeIds.set(id, (this.activeIds.get(id) || 0) + 1);
+    const key = this.key(spec);
+    this.activeIds.set(key, (this.activeIds.get(key) || 0) + 1);
     try {
-      const pdf = await this.pdf(id);
+      const pdf = await this.pdf(spec);
       if (!host.isConnected || generation !== this.generation || host.previewTicket !== ticket) return;
-      const pdfPage = await pdf.getPage(page);
+      const pdfPage = await pdf.getPage(spec.page);
       if (!host.isConnected || generation !== this.generation || host.previewTicket !== ticket) return;
-      const angle = (pdfPage.rotate + rotation) % 360;
+      const angle = (pdfPage.rotate + (spec.rotation || 0)) % 360;
+      const width = spec.width || 150;
       const initial = pdfPage.getViewport({ scale: 1, rotation: angle });
-      const viewport = pdfPage.getViewport({ scale: width / initial.width, rotation: angle });
+      const scale = Math.min(width / initial.width, spec.height > 0 ? spec.height / initial.height : Infinity);
+      const viewport = pdfPage.getViewport({ scale, rotation: angle });
       const ratio = Math.min(window.devicePixelRatio || 1, 2);
       const canvas = document.createElement('canvas');
       canvas.width = Math.ceil(viewport.width * ratio); canvas.height = Math.ceil(viewport.height * ratio);
@@ -77,8 +97,8 @@ export class Previews {
       const note = document.createElement('span'); note.className = 'preview-unavailable'; note.textContent = 'Preview unavailable';
       host.replaceChildren(note); host.title = 'The preview could not be rendered. PDF processing is still available.';
     } finally {
-      const remaining = this.activeIds.get(id) - 1;
-      if (remaining) this.activeIds.set(id, remaining); else this.activeIds.delete(id);
+      const remaining = this.activeIds.get(key) - 1;
+      if (remaining) this.activeIds.set(key, remaining); else this.activeIds.delete(key);
     }
   }
   pump() {
@@ -87,8 +107,8 @@ export class Previews {
       this.draw(item).finally(() => { this.active -= 1; this.pump(); });
     }
   }
-  async releaseUnused(ids) {
-    const keep = new Set(ids);
-    for (const id of [...this.cache.keys()]) if (!keep.has(id)) await this.forget(id);
+  async releaseUnused(keys) {
+    const keep = new Set(keys);
+    for (const key of [...this.cache.keys()]) if (!keep.has(key)) await this.forget(key);
   }
 }

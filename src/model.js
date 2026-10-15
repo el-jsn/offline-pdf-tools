@@ -52,17 +52,27 @@ export function splitPlan(mode, size, ranges, total, { separate = false, combine
   return plan;
 }
 
+export const pageKey = (page) => page.key ?? page.page;
 export function movePagesTo(pages, selected, position) {
-  const moving = pages.filter((page) => selected.has(page.page));
+  const moving = pages.filter((page) => selected.has(pageKey(page)));
   if (!moving.length) return pages;
-  const remaining = pages.filter((page) => !selected.has(page.page));
+  const remaining = pages.filter((page) => !selected.has(pageKey(page)));
   if (!Number.isInteger(position) || position < 1 || position > remaining.length + 1) throw new Error(`Choose a position between 1 and ${remaining.length + 1}.`);
   return [...remaining.slice(0, position - 1), ...moving, ...remaining.slice(position - 1)];
 }
 export function movePagesBeside(pages, selected, targetPage, after = false) {
   if (selected.has(targetPage)) return pages;
-  const remaining = pages.filter((page) => !selected.has(page.page));
-  const index = remaining.findIndex((page) => page.page === targetPage);
+  const remaining = pages.filter((page) => !selected.has(pageKey(page)));
+  const index = remaining.findIndex((page) => pageKey(page) === targetPage);
   if (index < 0) return pages;
   return movePagesTo(pages, selected, index + 1 + Number(after));
+}
+
+export function bookmarkGroups(bookmarks, total) {
+  const flattened = [];
+  const collect = (items) => { for (const item of items) { if (Number.isInteger(item.page) && item.page >= 1 && item.page <= total) flattened.push(item); collect(item.children || []); } };
+  collect(bookmarks);
+  const starts = [...new Set([1, ...flattened.map((item) => item.page)])].sort((a,b) => a-b);
+  if (!flattened.length) throw new Error('No page bookmarks.');
+  return starts.map((start,index) => ({ name: flattened.find((item) => item.page === start)?.title || `Part ${index + 1}`, pages: Array.from({length:(starts[index+1] || total+1)-start},(_,i) => start+i) }));
 }

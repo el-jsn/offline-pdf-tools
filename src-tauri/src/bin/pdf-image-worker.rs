@@ -19,6 +19,8 @@ struct Config {
     patch: PathBuf,
     directory: PathBuf,
     preset: String,
+    #[serde(default)] quality: Option<u8>,
+    #[serde(default)] dpi: Option<u32>,
 }
 #[derive(Clone)]
 struct Candidate {
@@ -32,7 +34,7 @@ struct Optimizer<'a> {
     visited: HashSet<[u8; 32]>,
     replacements: serde_json::Map<String, Value>,
     quality: u8,
-    max_edge: u32,
+    dpi: u32,
     examined: usize,
 }
 impl Optimizer<'_> {
@@ -93,7 +95,15 @@ impl Optimizer<'_> {
                     return Ok(());
                 }
             }
-            let scale = (self.max_edge as f64 / (width.max(height) as f64)).min(1.0);
+            // Nested form transforms and reused images may have different physical sizes.
+            // Preserve those images rather than guessing the lowest safe resolution.
+            if depth > 0 || candidates.len() != 1 { return Ok(()); }
+            let Ok(bounds) = object.bounds() else { return Ok(()); };
+            let display_width = bounds.width().value.abs() as f64;
+            let display_height = bounds.height().value.abs() as f64;
+            if display_width <= 0.0 || display_height <= 0.0 { return Ok(()); }
+            let scale = ((display_width * self.dpi as f64 / 72.0) / width as f64)
+                .max((display_height * self.dpi as f64 / 72.0) / height as f64).min(1.0);
             let target_width = ((width as f64 * scale).round() as u32).max(1);
             let target_height = ((height as f64 * scale).round() as u32).max(1);
             let resized = decoded
@@ -204,9 +214,9 @@ fn process(config: Config) -> Result<usize, String> {
     let document = pdfium
         .load_pdf_from_file(&config.document, None)
         .map_err(|_| "Image engine could not read this PDF.")?;
-    let (quality, max_edge) = match config.preset.as_str() {
-        "balanced" => (80, 2560),
-        "small" => (55, 1600),
+    let (quality, dpi) = match config.preset.as_str() {
+        "balanced" => (80, 240),
+        "small" => (65, 150),
         _ => return Err("Invalid image quality setting.".into()),
     };
     let mut optimizer = Optimizer {
@@ -214,8 +224,8 @@ fn process(config: Config) -> Result<usize, String> {
         candidates,
         visited: HashSet::new(),
         replacements: serde_json::Map::new(),
-        quality,
-        max_edge,
+        quality: config.quality.unwrap_or(quality),
+        dpi: config.dpi.unwrap_or(dpi),
         examined: 0,
     };
     for page in document.pages().iter() {

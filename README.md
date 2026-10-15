@@ -5,7 +5,7 @@ Documents are never uploaded.
 
 ## Features
 
-- Merge multiple PDFs in the order you choose.
+- Merge PDFs and JPEG, PNG, or WebP images in the order you choose. Each image becomes one page, preserving its proportions and orientation, with transparency on white. Images are limited to 32 megapixels; animated images use their first frame. HEIC is not supported.
 - Compress individually or in batches: Balanced by default, with lossless and Smallest options.
 - Balanced and Smallest resize and recompress embedded images, including CMYK photographs. Text and vector objects are preserved.
 - See the actual compressed size before saving. Saving uses the measured output.
@@ -75,3 +75,5 @@ Transparency masks, one-bit images, ambiguous image dictionaries, and images abo
 PDF processing and previews work offline. Update checks and installer downloads
 contact GitHub only when requested. Temporary working files are normally removed
 when finished or cleared; an interrupted app or forced quit can leave them behind.
+
+Organize accepts PDFs and JPEG, PNG, or WebP images through Add files or file drops. Drop beside a page to insert there, or outside the grid to append. Added pages retain their source for previews and saving, and insertion can be undone.
