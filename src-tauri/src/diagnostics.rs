@@ -24,6 +24,7 @@ impl Drop for Session { fn drop(&mut self) { TRACE.with(|slot| *slot.borrow_mut(
 pub fn unavailable() -> Failure { Failure {message:"PDF processing failed.".into(),details:Some(format!("PDF Tools {}\nPlatform: {}/{}\nThe processing task ended unexpectedly before a report could be completed.",env!("CARGO_PKG_VERSION"),std::env::consts::OS,std::env::consts::ARCH))} }
 pub fn stage(value: &str) { TRACE.with(|slot| {if let Some(trace)=slot.borrow_mut().as_mut(){trace.stage=value.to_owned();}}); }
 pub fn engine_version(major:u32,minor:u32,patch:u32) {event(format!("Engine: qpdf {major}.{minor}.{patch}"));}
+pub fn input_bytes(bytes:u64) { TRACE.with(|slot| {if let Some(trace)=slot.borrow_mut().as_mut(){trace.header.push_str(&format!("Input: {bytes} bytes; page count not yet determined\n"));}}); }
 pub fn inputs(values: impl Iterator<Item=(u64,u32)>) {
     TRACE.with(|slot| {if let Some(trace)=slot.borrow_mut().as_mut(){for (index,(bytes,pages)) in values.enumerate(){trace.header.push_str(&format!("Input {}: {bytes} bytes, {pages} pages\n",index+1));}}});
 }

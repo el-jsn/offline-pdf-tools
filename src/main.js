@@ -50,6 +50,11 @@ function processingError(view, error) {
   view.errorDetails = typeof error?.details === 'string' ? `Captured: ${new Date().toISOString()}\n${error.details}` : null;
   message(text, text.startsWith('Cancelled') ? '' : 'error');
 }
+function errorDetailsFor(view) {
+  const reports = view.importErrors.map((error, index) => error.details || `PDF Tools import error\nSkipped file ${index + 1}: ${error.reason}\nFilename excluded.`);
+  if (view.errorDetails) reports.unshift(view.errorDetails);
+  return reports.join('\n\n--------------------\n\n').slice(0, 256 * 1024);
+}
 function outputDocuments(view) {
   if (mode !== 'organize') return view.documents;
   const used = new Set(view.pages.map((page) => page.documentId || view.documents[0]?.id));
@@ -114,7 +119,7 @@ function controls() {
   $('swap-documents').disabled = busy || state.compare.documents.length !== 2;
   for (const button of $('compare-slots').querySelectorAll('button')) button.disabled = busy;
   $('continue-output').hidden = busy || !view.result;
-  $('copy-error-details').hidden = busy || !view.errorDetails;
+  $('copy-error-details').hidden = busy || !(view.errorDetails || view.importErrors.length);
   $('organizer-edits').hidden = mode !== 'organize' || !view.selected.size;
   $('organizer-selection').hidden = mode !== 'organize' || !view.selected.size;
   $('page-selection').hidden = mode === 'organize';
@@ -801,7 +806,7 @@ async function continueOutput() {
   busy = true; controls();
   try {
     const result = await invoke('import_result_documents', { resultId: id });
-    if (!result.documents.length) throw new Error(result.rejected[0]?.reason || 'The saved output is unavailable.');
+    if (!result.documents.length) { current().importErrors = result.rejected; throw new Error(result.rejected[0]?.reason || 'The saved output is unavailable.'); }
     busy = false; setMode(next); busy = true;
     await acceptSelection(result.documents); current().importErrors = result.rejected; showImportResult(result);
   } catch (error) { message(String(error), 'error'); }
@@ -1043,7 +1048,7 @@ $('share-app').addEventListener('click', async () => {
   } catch { message('Could not copy the download link.', 'error'); }
 });
 $('copy-error-details').addEventListener('click', async () => {
-  const details = current().errorDetails;
+  const details = errorDetailsFor(current());
   if (!details) return;
   try { await navigator.clipboard.writeText(details); message('Error details copied.'); }
   catch { message('Could not copy error details. Try again.', 'error'); }

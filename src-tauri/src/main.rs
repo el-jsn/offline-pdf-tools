@@ -792,7 +792,7 @@ struct ImportResult {
     rejected: Vec<ImportFailure>,
 }
 #[derive(Serialize)]
-struct ImportFailure { name: String, reason: String }
+struct ImportFailure { name: String, reason: String, details: Option<String> }
 
 fn select_path(store: &Store, engine: &Path, path: &Path) -> Result<Selected, String> {
         let path = fs::canonicalize(path).map_err(|_| "Cannot access this file.")?;
@@ -833,6 +833,9 @@ fn select_paths(store: &Store, engine: &Path, paths: Vec<PathBuf>, allow_images:
     for path in paths {
         let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         if !seen.insert(identity) { continue; }
+        let report=diagnostics::Session::begin("import","not applicable",false,None);
+        diagnostics::stage("Read and inspect imported file");
+        if let Ok(metadata)=fs::metadata(&path) {diagnostics::input_bytes(metadata.len());}
         let pdf = path.extension().is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("pdf"));
         let document = if !path.is_file() {
             Err("Choose a readable file, not a folder.".into())
@@ -841,14 +844,20 @@ fn select_paths(store: &Store, engine: &Path, paths: Vec<PathBuf>, allow_images:
         } else { select_path(store, engine, &path) };
         match document {
             Ok(document) => selected.push(document),
-            Err(reason) => result.rejected.push(ImportFailure { name: name(&path), reason }),
+            Err(reason) => {
+                let failure=report.fail(reason);
+                result.rejected.push(ImportFailure { name: name(&path), reason: failure.message, details: failure.details });
+            }
         }
     }
     let mut stored = store.documents.lock().map_err(|_| "Document selection is unavailable.")?;
     for document in selected {
         let existing = stored.iter().find(|(_, old)| old.path == document.path && old.digest == document.digest).map(|(id, _)| id.clone());
         if existing.is_none() && stored.len() >= MAX_DOCUMENTS {
-            result.rejected.push(ImportFailure { name: name(&document.path), reason: "Clear unused documents before adding more than 100 files.".into() });
+            let report=diagnostics::Session::begin("import","not applicable",false,None);
+            diagnostics::stage("Register imported file");
+            let failure=report.fail("Clear unused documents before adding more than 100 files.".into());
+            result.rejected.push(ImportFailure { name: name(&document.path), reason: failure.message, details: failure.details });
             continue;
         }
         let id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -1742,6 +1751,25 @@ mod import_batch_tests {
         let pdf = directory.join("valid.PDF");
         image_import::convert(&image, &pdf).unwrap();
         (pdf, image)
+    }
+    #[test]
+    fn skipped_files_have_reports_for_empty_and_mixed_imports() {
+        let directory=tempfile::tempdir().unwrap();
+        let bad=directory.path().join("PrivateClient-123456789.pdf");
+        fs::write(&bad,b"%PDF-1.4\nbroken synthetic PDF\n").unwrap();
+        let unsupported=directory.path().join("private-notes.txt");fs::write(&unsupported,b"synthetic").unwrap();
+        let store=Store::new().unwrap();
+        let result=select_paths(&store,&engine(),vec![bad.clone(),unsupported],false).unwrap();
+        assert!(result.documents.is_empty());assert_eq!(result.rejected.len(),2);
+        for rejected in &result.rejected {
+            let details=rejected.details.as_ref().unwrap();
+            assert!(details.contains("Operation: import"));
+            assert!(!details.contains("PrivateClient")&&!details.contains("123456789")&&!details.contains(directory.path().to_str().unwrap()));
+        }
+        assert!(result.rejected[0].details.as_ref().unwrap().contains("qpdf document inspection"));
+        let (valid,_)=fixture(directory.path());
+        let result=select_paths(&store,&engine(),vec![valid,bad],false).unwrap();
+        assert_eq!(result.documents.len(),1);assert_eq!(result.rejected.len(),1);assert!(result.rejected[0].details.is_some());
     }
     #[test]
     fn valid_files_survive_corrupt_and_unsupported_neighbors() {
