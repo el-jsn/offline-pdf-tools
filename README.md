@@ -15,7 +15,7 @@ Documents are never uploaded.
 - Split with thumbnail selection, named page groups, fixed groups, file size limits, every page, bookmarks, or page split points. Extract selected pages together or separately, combine custom groups, and preview output page lists.
 - Choose System, Light, or Dark with the sidebar's appearance buttons. The running Mac app's Dock icon follows the selected appearance.
 - Copy the latest app download link from the sidebar's share button.
-- When files are skipped or processing fails, use Copy error details to copy an in-memory support report with the failed step, available settings, file sizes/page counts, engine exit codes and recognized warnings. Paths, filenames, passwords and document-derived strings are excluded; unrecognized raw diagnostics are omitted. Import reports remain available alongside the skipped-file list, including when all files are rejected. Reports are never uploaded or written to log files.
+- When files are skipped or processing fails, use Copy error details to copy an in-memory support report with the failed step, available settings, file sizes/page counts, engine exit codes, processing steps, and warning categories with occurrence counts. Repeated warnings are grouped, and capture/report limits are identified. Paths, filenames, passwords, object values and document-derived strings are excluded; unrecognized raw diagnostics are counted and omitted. Import reports remain available alongside the skipped-file list, including when all files are rejected. Reports are never uploaded or written to log files.
 - Add files through drag and drop or the file picker. Invalid or unsupported files are listed individually; valid files in the same batch remain available.
 - Keep an optional page preview beside the working list. Small windows show it over the workspace; full preview remains resizable.
 - Review split outputs by cover, page range, and editable filename. Merge can create document bookmarks from filenames, retaining existing bookmarks beneath them.
@@ -78,7 +78,10 @@ existing private update key; it is not committed to this repository. See
 - Page bookmarks are remapped to retained pages. Bookmarks without a resolvable page destination can be omitted. Merging retains attachments with distinct prefixes. Changed page layouts can discard named destinations, XMP metadata, and accessibility tags. Accessibility tag changes show a notice; digital signature removal requires confirmation.
 
 Input PDFs with recoverable compressed-stream warnings are repaired in a temporary
-working copy. The repaired copy must pass strict structure, stream, and page-count
+working copy. Disconnected form widgets can also be reconnected when they are exact
+duplicates of existing fields, including their saved values and appearance references.
+Conflicting or ambiguous duplicates and nested orphan-field structures are not repaired
+automatically. The repaired copy must pass strict structure, stream, and page-count
 checks before processing. Unrepairable files are rejected. Warning-only processing
 results are accepted only after the output passes a separate structure, stream, and
 page-count check. Recovered data is identified in the status.

@@ -561,22 +561,30 @@ fn range_argument(pages: &[u32]) -> String {
     }
     chunks.join(",")
 }
-// Only private snapshots reach this function. Repair compressed streams once,
-// then require a clean check and the original page count before using the copy.
+// Only private snapshots reach this function. Reconnect equivalent duplicate
+// form widgets or repair compressed streams, then require a clean check and
+// the original page count before using the copy.
 fn repair_snapshot_if_needed(
     engine: &Path, snapshot: &Path, expected: usize, cancel: &AtomicBool,
 ) -> Result<bool, String> {
+    diagnostics::stage("Check input working copy");
     let (code, _) = run(Command::new(engine).arg("--check").arg(snapshot), Some(cancel))?;
     if code == 0 { return Ok(false); }
     if code != 3 { return Err("This PDF contains damaged data and could not be repaired. No output was saved.".into()); }
-    let candidate = tempfile::Builder::new().suffix(".pdf")
-        .tempfile_in(snapshot.parent().ok_or("Working folder unavailable.")?)
-        .map_err(|_| "Cannot create a repair copy.")?;
-    let (repair_code, _) = run(
-        Command::new(engine).args(["--recompress-flate", "--compress-streams=y", "--object-streams=generate"])
-            .arg(snapshot).arg(candidate.path()), Some(cancel),
-    )?;
-    if ![0, 3].contains(&repair_code) { return Err("This PDF could not be repaired. No output was saved.".into()); }
+    diagnostics::stage("Repair input working copy");
+    let candidate = if let Some(reconnected)=forms::reconnect_duplicate_widgets(engine,snapshot,cancel)? {
+        reconnected
+    } else {
+        let candidate = tempfile::Builder::new().suffix(".pdf")
+            .tempfile_in(snapshot.parent().ok_or("Working folder unavailable.")?)
+            .map_err(|_| "Cannot create a repair copy.")?;
+        let (repair_code, _) = run(
+            Command::new(engine).args(["--recompress-flate", "--compress-streams=y", "--object-streams=generate"])
+                .arg(snapshot).arg(candidate.path()), Some(cancel),
+        )?;
+        if ![0, 3].contains(&repair_code) { return Err("This PDF could not be repaired. No output was saved.".into()); }
+        candidate
+    };
     validate_output(engine, candidate.path(), expected, cancel)
         .map_err(|error| if error.starts_with("Cancelled") { error } else { "This PDF could not be repaired safely. No output was saved.".into() })?;
     let destination = File::options().read(true).write(true).open(snapshot)
@@ -592,6 +600,7 @@ fn validate_output(
     cancel: &AtomicBool,
 ) -> Result<u64, String> {
     diagnostics::stage("Validate output");
+    diagnostics::strict_validation();
     checked(
         Command::new(engine).arg("--check").arg(output),
         Some(cancel),
