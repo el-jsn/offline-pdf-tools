@@ -38,6 +38,8 @@ pub fn read_bounded(mut input: impl Read, limit: usize) -> io::Result<Capture> {
 pub fn action(command: &Command) -> &'static str {
     if command.get_program().to_string_lossy().ends_with("pdf-image-worker") || command.get_program().to_string_lossy().ends_with("pdf-image-worker.exe") {return "Image compression worker";}
     for arg in command.get_args() {let arg=arg.to_string_lossy();
+        if arg=="--is-encrypted" {return "qpdf encryption probe (exit 2 means unencrypted)";}
+        if arg=="--requires-password" {return "qpdf password probe";}
         if arg=="--check" {return "qpdf validation";}
         if arg=="--json" {return "qpdf document inspection";}
         if arg=="--show-npages" {return "qpdf page count";}
@@ -69,6 +71,8 @@ fn safe_messages(raw: &[u8]) -> Vec<String> {
         "image index exceeds the supported limit", "could not prepare compressed images",
         "could not write compressed images", "image workspace unavailable", "invalid image index",
         "out of memory", "bad_alloc", "cannot allocate memory", "failed to allocate", "insufficient memory",
+        "dictionary has duplicated key", "unknown token while reading object", "treating unknown token type as null",
+        "invalid character", "not a dictionary", "not an array", "loop detected",
     ];
     let mut output=Vec::new();let mut omitted=0;
     for line in String::from_utf8_lossy(raw).lines().take(64) {

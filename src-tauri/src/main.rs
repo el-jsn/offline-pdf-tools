@@ -280,6 +280,13 @@ fn checked(command: &mut Command, cancel: Option<&AtomicBool>) -> Result<Vec<u8>
     }
     Ok(output)
 }
+// Read-only inspection may complete with warnings. Callers still parse and
+// validate the returned metadata; output checks and processing remain strict.
+fn metadata_output(command: &mut Command, cancel: Option<&AtomicBool>) -> Result<Vec<u8>, String> {
+    let (code, output)=run(command,cancel)?;
+    if ![0,3].contains(&code) {return Err("The PDF engine could not inspect this file.".into());}
+    Ok(output)
+}
 fn check_version(engine: &Path) -> Result<(), String> {
     let output = checked(Command::new(engine).arg("--version"), None)?;
     let text = String::from_utf8_lossy(&output);
@@ -320,7 +327,7 @@ fn digest(path: &Path, cancel: Option<&AtomicBool>) -> Result<[u8; 32], String> 
     Ok(hash.finalize().into())
 }
 fn count_pages(engine: &Path, path: &Path, cancel: Option<&AtomicBool>) -> Result<u32, String> {
-    let output = checked(Command::new(engine).arg("--show-npages").arg(path), cancel)?;
+    let output = metadata_output(Command::new(engine).arg("--show-npages").arg(path), cancel)?;
     String::from_utf8_lossy(&output)
         .trim()
         .parse::<u32>()
@@ -362,7 +369,7 @@ fn inspect(engine: &Path, path: &Path, cancel: Option<&AtomicBool>) -> Result<Se
 }
 fn inspect_json(engine: &Path, path: &Path, cancel: Option<&AtomicBool>) -> Result<serde_json::Value, String> {
     let json_file = tempfile::NamedTempFile::new_in(path.parent().ok_or("Cannot inspect PDF information.")?).map_err(|_| "Cannot inspect PDF information.")?;
-    checked(Command::new(engine).args(["--json", "--json-stream-data=none"]).arg(path).arg(json_file.path()), cancel)?;
+    metadata_output(Command::new(engine).args(["--json", "--json-stream-data=none"]).arg(path).arg(json_file.path()), cancel)?;
     if json_file.as_file().metadata().map_err(|_| "Cannot inspect PDF information.")?.len() > 64 * 1024 * 1024 { return Err("Document structure is too complex.".into()); }
     serde_json::from_reader(json_file.as_file()).map_err(|_| "Cannot inspect PDF information.".into())
 }
@@ -1610,8 +1617,11 @@ mod stream_repair_tests {
     const VALID: &[u8] = &[120,156,115,10,81,208,119,51,84,48,52,82,8,73,83,48,55,2,34,3,133,144,20,5,141,224,202,188,146,140,212,146,204,100,133,228,162,212,148,204,18,133,162,212,130,252,162,18,133,180,204,138,146,210,162,84,77,133,144,44,5,215,16,46,0,51,230,19,31];
     fn engine_path() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("engine/qpdf") }
     fn fixture(stream: &[u8], path: &Path) {
+        fixture_catalog(stream,path,b"<< /Type /Catalog /Pages 2 0 R >>");
+    }
+    fn fixture_catalog(stream: &[u8], path: &Path, catalog: &[u8]) {
         let objects = vec![
-            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            catalog.to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
             [format!("<< /Length {} /Filter /FlateDecode >>\nstream\n", stream.len()).into_bytes(), stream.to_vec(), b"\nendstream".to_vec()].concat(),
@@ -1622,6 +1632,31 @@ mod stream_repair_tests {
         let start = pdf.len(); pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len()+1).as_bytes());
         for offset in offsets.iter().skip(1) { pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes()); }
         pdf.extend_from_slice(format!("trailer\n<< /Root 1 0 R /Size {} >>\nstartxref\n{}\n%%EOF\n", objects.len()+1, start).as_bytes()); fs::write(path,pdf).unwrap();
+    }
+    #[test]
+    fn metadata_warnings_import_but_outputs_still_require_clean_validation() {
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("metadata-warning.pdf");
+        fixture_catalog(VALID,&path,b"<< /Type /Catalog /Type /Catalog /Pages 2 0 R >>");
+        let before=fs::read(&path).unwrap();let engine=engine_path();let cancel=AtomicBool::new(false);
+        let json=tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        assert_eq!(run(Command::new(&engine).args(["--json","--json-stream-data=none"]).arg(&path).arg(json.path()),None).unwrap().0,3);
+        let store=Store::new().unwrap();let result=select_paths(&store,&engine,vec![path.clone()],false).unwrap();
+        assert!(result.rejected.is_empty());assert_eq!(result.documents.len(),1);assert_eq!(result.documents[0].pages,1);
+        assert_eq!(fs::read(&path).unwrap(),before);
+        // Accepting inspection warnings must not accept a warning-only output.
+        assert!(validate_output(&engine,&path,1,&cancel).is_err());
+        let selected=store.documents.lock().unwrap().get(&result.documents[0].id).unwrap().clone();
+        let working=selected.working_path();
+        assert!(repair_snapshot_if_needed(&engine,working,1,&cancel).unwrap());
+        validate_output(&engine,working,1,&cancel).unwrap();
+        assert_eq!(fs::read(&path).unwrap(),before);
+    }
+    #[test]
+    fn metadata_fatal_errors_are_still_rejected() {
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("broken.pdf");
+        fs::write(&path,b"%PDF-1.4\nbroken synthetic input\n").unwrap();
+        assert!(inspect_json(&engine_path(),&path,None).is_err());
+        assert!(count_pages(&engine_path(),&path,None).is_err());
     }
     #[test]
     fn repairs_unfinished_flate_and_preserves_content() {

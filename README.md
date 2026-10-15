@@ -81,6 +81,10 @@ checks before processing. Unrepairable files are rejected. Warning-only processi
 results are accepted only after the output passes a separate structure, stream, and
 page-count check. Recovered data is identified in the status.
 
+Read-only metadata inspection accepts QPDF's warning-only status when its JSON and
+page-count results are valid. Fatal inspection errors and malformed metadata are
+rejected. This does not relax validation of saved outputs.
+
 Lossless compression may produce little reduction. Balanced and Smallest resize
 and JPEG-compress eligible images and convert their decoded colors to RGB.
 Transparency masks, one-bit images, ambiguous image dictionaries, and images above
