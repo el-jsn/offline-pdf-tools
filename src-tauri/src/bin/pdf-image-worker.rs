@@ -1,4 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#[path = "../form_worker.rs"]
+mod form_appearances;
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType};
 use pdfium_render::prelude::*;
 use serde::Deserialize;
@@ -337,6 +339,13 @@ fn process(config: Config) -> Result<usize, String> {
 }
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    if args.len() == 5 && args[1] == "--prepare-forms" {
+        match form_appearances::prepare(Path::new(&args[2]), Path::new(&args[3]), Path::new(&args[4])) {
+            Ok(()) => println!("Form appearances prepared"),
+            Err(message) => { eprintln!("{message}"); std::process::exit(2); }
+        }
+        return;
+    }
     if args.len() == 3 && args[1] == "--check-runtime" {
         match Pdfium::bind_to_library(PathBuf::from(&args[2])) {
             Ok(bindings) => {

@@ -5,6 +5,7 @@ mod image_import;
 mod size_split;
 mod destination;
 mod diagnostics;
+mod forms;
 #[cfg(test)]
 mod acceptance;
 use serde::{Deserialize, Serialize};
@@ -1089,7 +1090,6 @@ async fn process_documents(
         if documents.iter().any(|doc| doc.features.unsupported_forms) { return Err("XFA forms are unsupported. Use a flattened copy.".into()); }
         let page_operation = request.operation != Operation::Compress;
         if page_operation && documents.iter().any(|doc| doc.features.forms) && !request.flatten_forms { return Err("Select Flatten forms before saving.".into()); }
-        if page_operation && documents.iter().any(|doc| doc.features.needs_appearances) { return Err("Save the filled form in its original application before flattening.".into()); }
         if documents.iter().any(|doc| doc.features.signatures) && !request.acknowledge_changes { return Err("Confirm digital signature removal before saving.".into()); }
         diagnostics::inputs(documents.iter().map(|document|(document.bytes,document.pages)));
         let engine = engine(&app)?; check_version(&engine)?;
@@ -1124,11 +1124,16 @@ async fn process_documents(
                 .map_err(|error| if error.starts_with("Cancelled") { error } else { format!("Document {}: {error}", index + 1) })?);
             if document.features.signatures || (page_operation && document.features.forms) {
                 let prepared = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot prepare forms.")?;
+                let appearances = if page_operation && document.features.forms && document.features.needs_appearances {
+                    Some(forms::prepare(&engine, snapshot.path(), workspace.path(), &cancel)?)
+                } else { None };
+                let form_input = appearances.as_ref().map_or(snapshot.path(), |file| file.path());
                 let mut command = Command::new(&engine);
                 if document.features.signatures { command.arg("--remove-restrictions"); }
                 if page_operation && document.features.forms { command.arg("--flatten-annotations=all").arg("--remove-acroform"); }
-                checked(command.arg(snapshot.path()).arg(prepared.path()), Some(&cancel))?;
+                checked(command.arg(form_input).arg(prepared.path()), Some(&cancel))?;
                 validate_output(&engine, prepared.path(), document.pages as usize, &cancel)?;
+                if page_operation && document.features.forms { forms::validate_flattened(&engine, prepared.path(), &cancel)?; }
                 copy_into(prepared.path(), snapshot.as_file(), Some(&cancel))?;
             }
             snapshots.push(snapshot);

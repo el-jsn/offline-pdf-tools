@@ -36,6 +36,7 @@ pub fn read_bounded(mut input: impl Read, limit: usize) -> io::Result<Capture> {
     Ok(Capture {bytes,truncated})
 }
 pub fn action(command: &Command) -> &'static str {
+    if command.get_args().any(|arg| arg == "--prepare-forms") {return "PDFium form appearance preparation";}
     if command.get_program().to_string_lossy().ends_with("pdf-image-worker") || command.get_program().to_string_lossy().ends_with("pdf-image-worker.exe") {return "Image compression worker";}
     for arg in command.get_args() {let arg=arg.to_string_lossy();
         if arg=="--is-encrypted" {return "qpdf encryption probe (exit 2 means unencrypted)";}

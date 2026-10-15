@@ -66,7 +66,7 @@ function changesFor(view) {
   const docs = outputDocuments(view).filter((doc) => !doc.locked);
   const any = (test) => docs.some((doc) => test(doc.features));
   const blocked = any((features) => features.unsupportedForms) ? 'XFA forms are unsupported. Print or export a flattened copy, then add it again.'
-    : pageOperation && any((features) => features.needsAppearances) ? 'A filled form must be saved in its original application before it can be changed.' : null;
+    : null;
   const flatten = !blocked && pageOperation && any((features) => features.forms);
   const acknowledge = !blocked && any((features) => features.signatures);
   const notes = [];
