@@ -6,6 +6,8 @@ Design direction: keep the current system typography and appearance choices. Whi
 
 Layout: navigation on the left, working documents in the center, optional reading pane on the right. Text and controls align to the working document edges. At narrow widths the reading pane overlays the workspace with a visible close action. There are no decorative panels, banners, or new instructional sections. Selection actions appear when pages are selected; undo and page checking remain available independently.
 
+Simple defaults: filename bookmarks sit inside Merge's collapsed Options. Split's Review outputs starts collapsed and resets when a new source is chosen. Saved-limit controls appear only for a usable target or existing presets. Page checking sits inside Organize's More menu. A fresh Organize import starts with no pages selected, so edit actions appear only after selection; appended pages remain selected for placement. Selection counts are shown once. Native Mac checks confirmed the initial quiet toolbar, access to page checking without selection, and edit actions appearing after selecting a page.
+
 The distinctive element is the document itself: split covers and page ranges for output review, source labels for mixed packages, and two columns showing removed and added wording. Controls use the existing SVG assets. The comparison limitation is functional information beside its results.
 
 Implementation:

@@ -100,14 +100,21 @@ function controls() {
   $('toggle-inspector').disabled = busy;
   $('check-pages').hidden = mode !== 'organize'; $('check-pages').disabled = busy || !view.pages.length;
   $('merge-bookmarks').disabled = busy;
-  $('save-limit').disabled = busy || !targetBytes(state.compress) || preferences.presets.length >= 12;
+  const canSaveLimit = Boolean(targetBytes(state.compress)) && preferences.presets.length < 12;
+  $('save-limit').hidden = !canSaveLimit; $('save-limit').disabled = busy || !canSaveLimit;
+  $('limit-presets').hidden = !preferences.presets.length && !canSaveLimit;
+  $('limit-preset').hidden = !preferences.presets.length;
   $('limit-preset').disabled = busy || state.compress.compression === 'lossless';
   $('delete-limit').disabled = busy;
   $('swap-documents').disabled = busy || state.compare.documents.length !== 2;
   for (const button of $('compare-slots').querySelectorAll('button')) button.disabled = busy;
   $('continue-output').hidden = busy || !view.result;
   $('organizer-edits').hidden = mode !== 'organize' || !view.selected.size;
-  document.querySelector('.page-more').hidden = mode !== 'organize' || !view.selected.size;
+  $('organizer-selection').hidden = mode !== 'organize' || !view.selected.size;
+  $('page-selection').hidden = mode === 'organize';
+  document.querySelector('.page-more').hidden = mode !== 'organize';
+  $('selected-page-actions').hidden = !view.selected.size;
+  $('merge-options-summary').textContent = view.mergeBookmarks ? 'Options: bookmarks on' : 'Options';
   for (const button of $('page-review').querySelectorAll('button')) button.disabled = busy; $('choose').disabled = busy || !ready;
   $('busy-indicator').hidden = !busy; $('loaded').setAttribute('aria-busy', String(busy));
   $('cancel').hidden = !busy || !cancelAvailable; $('reveal').hidden = busy || !view.result;
@@ -426,6 +433,7 @@ async function acceptSelection(selected, insertionIndex) {
   } else if (mode === 'organize') {
     if (view.pages.length + selected.reduce((sum, doc) => sum + doc.pages, 0) > 20000) throw new Error('Choose at most 20,000 pages.');
     const added = pagesFromDocuments(selected, () => --duplicateKey);
+    const wasEmpty = !view.pages.length;
     rememberEdit();
     const position = insertionIndex ?? view.pages.length;
     let pendingPosition = position;
@@ -436,13 +444,13 @@ async function acceptSelection(selected, insertionIndex) {
       if (existing < 0) view.documents.push(doc); else view.documents[existing] = doc;
     }
     view.pages = insertPages(view.pages, added, position);
-    view.selected = new Set(added.map(pageKey));
+    view.selected = wasEmpty ? new Set() : new Set(added.map(pageKey));
     view.pageWindow = Math.floor(position / PAGE_WINDOW); lastSelected = null;
   } else {
     view.documents = selected;
     view.pages = ['organize', 'split'].includes(mode) ? Array.from({ length: selected[0].pages }, (_, index) => ({ page: index + 1, rotation: 0 })) : [];
     view.selected.clear(); view.history = []; view.pageWindow = 0; lastSelected = null;
-    if (mode === 'split') { view.outputLabels = {}; view.ranges = ''; view.splitGroups = ['']; view.splitNames = ['']; view.activeGroup = 0; view.splitCuts = ''; $('split-ranges').value = ''; $('split-cuts').value = ''; }
+    if (mode === 'split') { $('split-output-details').open = false; view.outputLabels = {}; view.ranges = ''; view.splitGroups = ['']; view.splitNames = ['']; view.activeGroup = 0; view.splitCuts = ''; $('split-ranges').value = ''; $('split-cuts').value = ''; }
   }
   resetEdits(view); view.result = null; view.review = null;
   for (const doc of selected) await previews.forget(doc.id);
@@ -890,6 +898,7 @@ function renderComparisonChanges(limit = 30) {
 async function checkPages() {
   const view = current();
   if (busy || mode !== 'organize') return;
+  document.querySelector('.page-more').open = false;
   if (view.pages.length > 500) { message('Check up to 500 pages at a time. Split a section first.', 'error'); return; }
   busy = true; cancelAvailable = true; let cancelled = false; localCancel = () => { cancelled = true; };
   controls(); const findings = [], seen = new Map();
@@ -963,12 +972,13 @@ $('password-form').addEventListener('submit', async (event) => {
     const previous = view.documents[index];
     view.documents[index] = tool === 'compare' ? { ...info, compareRole: previous.compareRole } : info;
     if (tool === 'organize') {
+      const wasEmpty = !view.pages.length;
       view.history.push(view.pages.map((page) => ({ ...page }))); view.future = [];
       const added = pagesFromDocuments([info], () => --duplicateKey);
       const position = Math.min(previous.insertionIndex ?? view.pages.length, view.pages.length);
       view.pages = insertPages(view.pages, added, position);
       for (const pending of view.documents) if (pending.locked && pending.insertionIndex >= position) pending.insertionIndex += added.length;
-      view.selected = new Set(added.map(pageKey)); view.result = null;
+      view.selected = wasEmpty ? new Set() : new Set(added.map(pageKey)); view.result = null;
     } else if (tool === 'split') {
       view.pages = Array.from({ length: info.pages }, (_, page) => ({ page: page + 1, rotation: 0 }));
       view.selected.clear(); view.history = []; view.future = []; view.pageWindow = 0; view.result = null;

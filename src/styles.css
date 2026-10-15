@@ -1103,3 +1103,11 @@ input[aria-invalid=true] { border-color:var(--error); }
 }
 
 .inspecting .compare-slots,.inspecting .compare-columns { grid-template-columns:1fr; }
+
+.quiet-options>summary { width:fit-content; cursor:pointer; color:var(--muted); font-size:12px; }
+.quiet-options[open]>summary { margin-bottom:12px; }
+.quiet-options>summary:focus-visible { outline:3px solid #007aff66; outline-offset:3px; }
+#selected-page-actions { display:grid; gap:8px; }
+#selected-page-actions:not([hidden])+#check-pages { border-top:1px solid var(--border); border-radius:0; padding-top:12px; }
+
+.page-navigation>div { margin-left:auto; }
