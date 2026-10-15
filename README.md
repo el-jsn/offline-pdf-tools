@@ -15,6 +15,7 @@ Documents are never uploaded.
 - Split with thumbnail selection, named page groups, fixed groups, file size limits, every page, bookmarks, or page split points. Extract selected pages together or separately, combine custom groups, and preview output page lists.
 - Choose System, Light, or Dark with the sidebar's appearance buttons. The running Mac app's Dock icon follows the selected appearance.
 - Copy the latest app download link from the sidebar's share button.
+- When processing fails, use Copy error details to copy an in-memory support report with the failed step, settings, file sizes/page counts, engine exit codes and recognized warnings. Paths, filenames, passwords and document-derived strings are excluded; unrecognized raw diagnostics are omitted. Reports are never uploaded or written to log files and are cleared by the next operation, changing the selection, or quitting.
 - Add files through drag and drop or the file picker. Invalid or unsupported files are listed individually; valid files in the same batch remain available.
 - Keep an optional page preview beside the working list. Small windows show it over the workspace; full preview remains resizable.
 - Review split outputs by cover, page range, and editable filename. Merge can create document bookmarks from filenames, retaining existing bookmarks beneath them.

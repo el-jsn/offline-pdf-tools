@@ -4,6 +4,7 @@ mod workspace;
 mod image_import;
 mod size_split;
 mod destination;
+mod diagnostics;
 #[cfg(test)]
 mod acceptance;
 use serde::{Deserialize, Serialize};
@@ -189,8 +190,10 @@ fn cancelled(cancel: Option<&AtomicBool>) -> Result<(), String> {
     }
 }
 fn progress(channel: &Channel<Progress>, message: impl Into<String>, cancellable: bool) {
+    let message=message.into();
+    diagnostics::stage(&message);
     let _ = channel.send(Progress {
-        message: message.into(),
+        message,
         cancellable,
     });
 }
@@ -221,59 +224,49 @@ fn engine(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     }
     Ok(path)
 }
-// No shell and no document diagnostic logs. Bound output and terminate stalled jobs.
+// No shell or persistent logs. Drain both pipes; retain only bounded captures.
 fn run(command: &mut Command, cancel: Option<&AtomicBool>) -> Result<(i32, Vec<u8>), String> {
     cancelled(cancel)?;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
+    let action=diagnostics::action(command);
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)] {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|_| "Cannot start the local PDF engine.")?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("Cannot read PDF engine results.")?;
-    let reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout
-            .take(2 * 1024 * 1024)
-            .read_to_end(&mut output)
-            .map(|_| output)
-    });
-    let started = Instant::now();
-    let status = loop {
-        if cancelled(cancel).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err("Cancelled. No output was saved.".into());
+    let mut child=command.spawn().map_err(|error| {
+        diagnostics::command_result(action,&format!("start failed, OS error {:?}",error.raw_os_error()),&diagnostics::Capture{bytes:vec![],truncated:false});
+        "Cannot start the local PDF engine."
+    })?;
+    let stdout=child.stdout.take().ok_or("Cannot read PDF engine results.")?;
+    let stderr=child.stderr.take().ok_or("Cannot read PDF engine diagnostics.")?;
+    let reader=thread::spawn(move || diagnostics::read_bounded(stdout,2*1024*1024));
+    let errors=thread::spawn(move || diagnostics::read_bounded(stderr,64*1024));
+    let started=Instant::now();
+    let status=loop {
+        let stopped=cancelled(cancel).is_err();
+        if stopped || started.elapsed()>=Duration::from_secs(600) {
+            let _=child.kill();let _=child.wait();let _=reader.join();
+            if let Ok(Ok(capture))=errors.join(){diagnostics::command_result(action,if stopped {"cancelled"} else {"timed out after 600 seconds"},&capture);}
+            return Err(if stopped {"Cancelled. No output was saved."} else {"PDF processing stopped after an engine error or a ten-minute time limit. Try a smaller document."}.into());
         }
         match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < Duration::from_secs(600) => {
-                thread::sleep(Duration::from_millis(50))
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err("PDF processing stopped after an engine error or a ten-minute time limit. Try a smaller document.".into());
+            Ok(Some(status))=>break status,
+            Ok(None)=>thread::sleep(Duration::from_millis(50)),
+            Err(error)=>{
+                let _=child.kill();let _=child.wait();let _=reader.join();
+                if let Ok(Ok(capture))=errors.join(){diagnostics::command_result(action,&format!("wait failed, OS error {:?}",error.raw_os_error()),&capture);}
+                return Err("PDF processing stopped after an engine error. No output was saved.".into());
             }
         }
     };
-    let output = reader
-        .join()
-        .map_err(|_| "Cannot read PDF engine results.")?
-        .map_err(|_| "Cannot read PDF engine results.")?;
+    let capture=errors.join().ok().and_then(Result::ok).unwrap_or(diagnostics::Capture{bytes:vec![],truncated:true});
+    let code=status.code().unwrap_or(-1);
+    let mut result=format!("exit {code}, {} ms",started.elapsed().as_millis());
+    #[cfg(unix)] {use std::os::unix::process::ExitStatusExt;if let Some(signal)=status.signal(){result.push_str(&format!(", signal {signal}"));}}
+    diagnostics::command_result(action,&result,&capture);
+    let output=reader.join().map_err(|_| "Cannot read PDF engine results.")?.map_err(|_| "Cannot read PDF engine results.")?;
     cancelled(cancel)?;
-    Ok((status.code().unwrap_or(-1), output))
+    Ok((code,output.bytes))
 }
 fn checked(command: &mut Command, cancel: Option<&AtomicBool>) -> Result<Vec<u8>, String> {
     let (code, output) = run(command, cancel)?;
@@ -299,6 +292,7 @@ fn check_version(engine: &Path) -> Result<(), String> {
         .filter_map(|part| part.parse::<u32>().ok());
     let major = parts.next().unwrap_or(0);
     let minor = parts.next().unwrap_or(0);
+    diagnostics::engine_version(major,minor,parts.next().unwrap_or(0));
     if major < 12 || (major == 12 && minor < 1) {
         return Err("qpdf 12.1 or newer is required.".into());
     }
@@ -565,6 +559,7 @@ fn validate_output(
     expected: usize,
     cancel: &AtomicBool,
 ) -> Result<u64, String> {
+    diagnostics::stage("Validate output");
     checked(
         Command::new(engine).arg("--check").arg(output),
         Some(cancel),
@@ -606,6 +601,7 @@ fn optimize_images(
     tuning: Option<(u8, u32)>,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
+    diagnostics::stage("Compress images");
     let (worker, library) = image_runtime(engine)?;
     let directory = tempfile::Builder::new()
         .prefix("images-")
@@ -1027,9 +1023,13 @@ async fn process_documents(
     state: tauri::State<'_, Arc<Store>>,
     request: Request,
     on_progress: Channel<Progress>,
-) -> Result<Option<Saved>, String> {
+) -> Result<Option<Saved>, diagnostics::Failure> {
     let store = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let operation=match request.operation {Operation::Merge=>"merge",Operation::Compress=>"compress",Operation::Split=>"split",Operation::Organize=>"organize"};
+        let quality=match request.compression {Compression::Lossless=>"original quality",Compression::Balanced=>"balanced",Compression::Small=>"smaller"};
+        let report=diagnostics::Session::begin(operation,quality,request.measure_only,request.target_bytes);
+        let result=(|| -> Result<Option<Saved>,String> {
         let _busy = store.operation.try_lock().map_err(|_| "Another operation is in progress.")?;
         uuid::Uuid::parse_str(&request.job_id).map_err(|_| "Invalid job identifier.")?;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1075,6 +1075,7 @@ async fn process_documents(
         if page_operation && documents.iter().any(|doc| doc.features.forms) && !request.flatten_forms { return Err("Select Flatten forms before saving.".into()); }
         if page_operation && documents.iter().any(|doc| doc.features.needs_appearances) { return Err("Save the filled form in its original application before flattening.".into()); }
         if documents.iter().any(|doc| doc.features.signatures) && !request.acknowledge_changes { return Err("Confirm digital signature removal before saving.".into()); }
+        diagnostics::inputs(documents.iter().map(|document|(document.bytes,document.pages)));
         let engine = engine(&app)?; check_version(&engine)?;
         let suffix = match request.operation { Operation::Merge => "merged", Operation::Compress => "compressed", Operation::Split => "split", Operation::Organize => "organized" };
         let filename = if request.operation == Operation::Merge { "merged.pdf".into() } else { format!("{}-{suffix}.pdf", documents[0].path.file_stem().unwrap_or_default().to_string_lossy()) };
@@ -1266,7 +1267,9 @@ async fn process_documents(
             staged.persist_noclobber(&destination).map_err(|_| "Cannot save the PDF. Choose a new filename and a writable folder.")?;
             Ok(Some(record_result(&store, destination.clone(), vec![destination], 1, input_bytes, output_bytes, recovered)?))
         }
-    }).await.map_err(|_| "PDF processing failed.")?
+        })();
+        result.map_err(|message| report.fail(message))
+    }).await.map_err(|_| diagnostics::unavailable())?
 }
 #[tauri::command]
 async fn import_result_documents(app: tauri::AppHandle, state: tauri::State<'_, Arc<Store>>, result_id: String) -> Result<ImportResult, String> {

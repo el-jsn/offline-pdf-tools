@@ -25,7 +25,7 @@ const tools = {
 const state = Object.fromEntries(Object.keys(tools).map((tool) => [tool, {
   documents: [], importErrors: [], pages: [], selected: new Set(), history: [], future: [], pageWindow: 0,
   outputLabels: {}, review: null, comparison: null, mergeBookmarks: false,
-  compressionPreview: null, measurementKey: null, measurementFailed: false, compression: 'balanced', targetSize: '', splitMode: 'selected', splitSize: '10', groupSize: '5', ranges: '', splitGroups: [''], splitNames: [''], activeGroup: 0, splitSeparate: false, splitCombine: false, splitCuts: '', flattenForms: false, acknowledgeChanges: false, result: null,
+  compressionPreview: null, measurementKey: null, measurementFailed: false, compression: 'balanced', targetSize: '', splitMode: 'selected', splitSize: '10', groupSize: '5', ranges: '', splitGroups: [''], splitNames: [''], activeGroup: 0, splitSeparate: false, splitCombine: false, splitCuts: '', flattenForms: false, acknowledgeChanges: false, result: null, errorDetails: null,
 }]));
 let mode = 'merge'; let busy = false; let ready = false; let jobId = null; let cancelAvailable = false; let lastSelected = null;
 let compressionTimer = null;
@@ -45,6 +45,11 @@ const current = () => state[mode];
 const previews = new Previews();
 for (const element of document.querySelectorAll('[data-icon]')) element.replaceWith(icon(element.dataset.icon));
 function message(text, type = '') { $('status').textContent = text; $('status').className = type; }
+function processingError(view, error) {
+  const text = typeof error?.message === 'string' ? error.message : String(error);
+  view.errorDetails = typeof error?.details === 'string' ? `Captured: ${new Date().toISOString()}\n${error.details}` : null;
+  message(text, text.startsWith('Cancelled') ? '' : 'error');
+}
 function outputDocuments(view) {
   if (mode !== 'organize') return view.documents;
   const used = new Set(view.pages.map((page) => page.documentId || view.documents[0]?.id));
@@ -109,6 +114,7 @@ function controls() {
   $('swap-documents').disabled = busy || state.compare.documents.length !== 2;
   for (const button of $('compare-slots').querySelectorAll('button')) button.disabled = busy;
   $('continue-output').hidden = busy || !view.result;
+  $('copy-error-details').hidden = busy || !view.errorDetails;
   $('organizer-edits').hidden = mode !== 'organize' || !view.selected.size;
   $('organizer-selection').hidden = mode !== 'organize' || !view.selected.size;
   $('page-selection').hidden = mode === 'organize';
@@ -403,6 +409,7 @@ async function cleanRegistry() {
   await previews.releaseUnused(ids);
 }
 function resetEdits(view) {
+  view.errorDetails = null;
   view.flattenForms = false; view.acknowledgeChanges = false; view.future = [];
 }
 async function removeDocument(id) {
@@ -596,7 +603,7 @@ async function measureCompression(key) {
   if (mode !== 'compress' || busy || !ready || !current().documents.length || !validation()) return;
   const view = current();
   if (key !== JSON.stringify([view.compression, view.targetSize, view.acknowledgeChanges, view.documents.map((doc) => doc.id)])) return;
-  view.measurementKey = key; view.measurementFailed = false; view.compressionPreview = null;
+  view.measurementKey = key; view.measurementFailed = false; view.compressionPreview = null; view.errorDetails = null;
   busy = true; cancelAvailable = false; jobId = crypto.randomUUID(); controls();
   const onProgress = new Channel();
   onProgress.onmessage = (progress) => { message(progress.message); cancelAvailable = progress.cancellable; controls(); };
@@ -607,7 +614,7 @@ async function measureCompression(key) {
     message(view.compressionPreview.recovered ? 'Ready to save. PDF data recovered; review the saved copy.' : 'Ready to save');
   } catch (error) {
     view.measurementFailed = true;
-    message(String(error), String(error).startsWith('Cancelled') ? '' : 'error');
+    processingError(view, error);
   } finally {
     busy = false; jobId = null; cancelAvailable = false; render();
   }
@@ -616,6 +623,7 @@ async function save() {
   if (mode === 'compare') { await compareDocuments(); return; }
   if (busy || !ready || !validation() || (mode === 'compress' && !current().compressionPreview && !current().measurementFailed)) return;
   busy = true; cancelAvailable = false; const activeMode = mode; const view = current(); jobId = crypto.randomUUID();
+  view.errorDetails = null;
   const onProgress = new Channel(); onProgress.onmessage = (progress) => { message(progress.message); cancelAvailable = progress.cancellable; controls(); };
   controls(); message(mode === 'split' || (mode === 'compress' && view.documents.length > 1) ? 'Select output folder' : 'Select save location');
   try {
@@ -626,7 +634,7 @@ async function save() {
     if (activeMode === 'compress') text += result.outputBytes < result.inputBytes ? ` ${Math.round((1 - result.outputBytes / result.inputBytes) * 100)}% smaller.` : result.recovered ? ' Saved a repaired copy.' : ' Already optimized. Saved an unchanged copy.';
     if (result.recovered) text += ' PDF data recovered; review the saved copy.';
     message(text, 'success');
-  } catch (error) { message(String(error), String(error).startsWith('Cancelled') ? '' : 'error'); }
+  } catch (error) { processingError(view, error); }
   finally { busy = false; jobId = null; cancelAvailable = false; renderContinuation(); controls(); }
 }
 function editPages(action) {
@@ -1033,6 +1041,12 @@ $('share-app').addEventListener('click', async () => {
     await navigator.clipboard.writeText('https://github.com/el-jsn/offline-pdf-tools/releases/latest');
     message('Download link copied.');
   } catch { message('Could not copy the download link.', 'error'); }
+});
+$('copy-error-details').addEventListener('click', async () => {
+  const details = current().errorDetails;
+  if (!details) return;
+  try { await navigator.clipboard.writeText(details); message('Error details copied.'); }
+  catch { message('Could not copy error details. Try again.', 'error'); }
 });
 $('retry-engine').addEventListener('click', checkEngine);
 $('cancel').addEventListener('click', async () => {
