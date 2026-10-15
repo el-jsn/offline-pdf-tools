@@ -1,7 +1,7 @@
 {
   "name": "offline-pdf-tools",
   "private": true,
-  "version": "1.0.5",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "node scripts/build-image-worker.mjs && node scripts/prepare-assets.mjs && vite --host 127.0.0.1 --port 1420 --strictPort",

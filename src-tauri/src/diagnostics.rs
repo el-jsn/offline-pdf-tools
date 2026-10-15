@@ -24,6 +24,7 @@ impl Drop for Session { fn drop(&mut self) { TRACE.with(|slot| *slot.borrow_mut(
 pub fn unavailable() -> Failure { Failure {message:"PDF processing failed.".into(),details:Some(format!("PDF Tools {}\nPlatform: {}/{}\nThe processing task ended unexpectedly before a report could be completed.",env!("CARGO_PKG_VERSION"),std::env::consts::OS,std::env::consts::ARCH))} }
 pub fn stage(value: &str) { TRACE.with(|slot| {if let Some(trace)=slot.borrow_mut().as_mut(){trace.stage=value.to_owned();}}); }
 pub fn engine_version(major:u32,minor:u32,patch:u32) {event(format!("Engine: qpdf {major}.{minor}.{patch}"));}
+pub fn compression_engine() {event("Compressor: compress-pdf 0.1.0".into());}
 pub fn input_bytes(bytes:u64) { TRACE.with(|slot| {if let Some(trace)=slot.borrow_mut().as_mut(){trace.header.push_str(&format!("Input: {bytes} bytes; page count not yet determined\n"));}}); }
 pub fn inputs(values: impl Iterator<Item=(u64,u32)>) {
     TRACE.with(|slot| {if let Some(trace)=slot.borrow_mut().as_mut(){for (index,(bytes,pages)) in values.enumerate(){trace.header.push_str(&format!("Input {}: {bytes} bytes, {pages} pages\n",index+1));}}});
@@ -36,6 +37,7 @@ pub fn read_bounded(mut input: impl Read, limit: usize) -> io::Result<Capture> {
     Ok(Capture {bytes,truncated})
 }
 pub fn action(command: &Command) -> &'static str {
+    if matches!(std::path::Path::new(command.get_program()).file_name().and_then(|name| name.to_str()), Some("compress-pdf" | "compress-pdf.exe")) {return "PDF compression";}
     if command.get_args().any(|arg| arg == "--prepare-forms") {return "PDFium form appearance preparation";}
     if command.get_program().to_string_lossy().ends_with("pdf-image-worker") || command.get_program().to_string_lossy().ends_with("pdf-image-worker.exe") {return "Image compression worker";}
     for arg in command.get_args() {let arg=arg.to_string_lossy();

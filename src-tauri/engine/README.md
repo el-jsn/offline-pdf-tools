@@ -1,7 +1,14 @@
-# Bundled PDF engine
+# Bundled PDF engines
 
 Agents receive qpdf with the app; they do not install anything separately.
 Use a trusted qpdf 12.1+ native runtime from https://github.com/qpdf/qpdf.
+
+Balanced and Smaller compression use the separately bundled compress-pdf 0.1.0
+executable. Stage a native build with scripts/stage-compressor.py, supplying the
+MIT license and all Rust/native dependency notices. The staging script signs the
+Mac executable, rejects non-system Mac library dependencies, and records hashes.
+scripts/check-engine.mjs requires this runtime and its notices before packaging.
+The compressor is built during developer setup, never downloaded at runtime.
 
 Use scripts/stage-engine.py on the target OS and architecture. Supply the exact
 runtime licenses and third-party notices through its --notices argument. It stages:

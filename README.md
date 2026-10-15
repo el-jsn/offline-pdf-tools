@@ -6,9 +6,9 @@ Documents are never uploaded.
 ## Features
 
 - Merge PDFs and JPEG, PNG, or WebP images in the order you choose. Each image becomes one page, preserving its proportions and orientation, with transparency on white. Images are limited to 32 megapixels; animated images use their first frame. HEIC is not supported.
-- Compress individually or in batches: Balanced by default, with lossless and Smallest options.
-- Balanced and Smallest resize and recompress embedded images, including CMYK photographs. Text and vector objects are preserved.
-- Shared images use their largest displayed size when compressed. All four tools remove unused page resources and pack PDF objects without changing page content.
+- Compress individually or in batches: Balanced by default, with Original quality and Smaller options.
+- Balanced and Smaller use the bundled compress-pdf engine to optimize images, embedded fonts, and PDF structure.
+- Compression accounts for shared-image placements. Merge, Split, and Organize remove unused page resources and pack PDF objects without changing page drawing instructions.
 - See the actual compressed size before saving and compare the original and compressed pages. Set an optional limit per PDF; an unmet limit is identified. Saving uses the measured output.
 - Preview source PDFs in all four tools with page navigation and zoom. Organize previews follow the current page order and rotations.
 - Organize pages with group dragging, edge scrolling, keyboard selection, previews, rotation, duplication, removal, undo/redo, and moves to a specific position.
@@ -45,9 +45,11 @@ so operating system security warnings may appear.
 ## Build
 
 Requires Node 22.16+, npm, Rust 1.90+, and the [Tauri platform prerequisites](https://v2.tauri.app/start/prerequisites/).
-The native runtimes are qpdf 12.1+ and PDFium. On a fresh checkout, stage their
+The native runtimes are qpdf 12.1+, PDFium, and compress-pdf 0.1.0. On a fresh checkout, stage their
 libraries and matching license notices using `scripts/stage-engine.py` and
-`scripts/stage-pdfium.py`. The release build compiles and bundles the image worker.
+`scripts/stage-pdfium.py`, then `scripts/stage-compressor.py` as described in
+the release instructions. Building compress-pdf separately needs Rust 1.92+.
+The release build compiles and bundles the image worker.
 
 ```sh
 npm ci
@@ -85,10 +87,20 @@ Read-only metadata inspection accepts QPDF's warning-only status when its JSON a
 page-count results are valid. Fatal inspection errors and malformed metadata are
 rejected. This does not relax validation of saved outputs.
 
-Lossless compression may produce little reduction. Balanced and Smallest resize
-and JPEG-compress eligible images and convert their decoded colors to RGB.
-Transparency masks, one-bit images, ambiguous image dictionaries, and images above
-32 million pixels are preserved. Images inside nested graphics and images in documents with nonstandard page units are also preserved. Other presets can reduce image quality. A file that cannot be made smaller is saved as an unchanged copy.
+Original quality uses qpdf's lossless structural compression and may produce little
+reduction. Balanced uses compress-pdf 0.1.0's Standard preset (150 DPI target,
+JPEG quality 60); Smaller uses More (72 DPI target, JPEG quality 60, RGB image
+conversion). Both also optimize embedded fonts and PDF structure. Document
+stripping and standard-font unembedding are disabled. Metadata, accessibility
+tags and output intents are retained; bookmarks, attachments and saved form values
+are checked before accepting a compressed copy. Unsupported content may be kept
+unchanged or rejected by the compressor. Image quality and font appearance can
+change, so review the comparison preview. These are lossy presets, not pixel-exact
+preservation. A file that cannot be made smaller is saved as an unchanged copy.
+
+An upload limit tries progressively lower image resolutions within the selected
+preset's floor, always starting each attempt from the same private source. It
+does not guarantee that a requested size can be reached.
 
 PDF processing and previews work offline. Update checks and installer downloads
 contact GitHub only when requested. Private working copies are removed when cleared or the app quits. Closing the Mac window keeps the current session in memory and its private workspace available. Abandoned private workspaces are reclaimed on a later launch; active instances are protected by file locks. A forced quit during the final output publication step can leave a staging file in the selected destination.

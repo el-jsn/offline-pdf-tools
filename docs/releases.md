@@ -26,6 +26,25 @@ processing run in a separate executable so cancellation, timeouts, or a native
 engine failure do not terminate the app. The build checks library loading before
 packaging. There are no runtime downloads.
 
+Stage compress-pdf 0.1.0 for the native target as well. Its build needs Rust 1.92+
+and the native prerequisites listed by that crate (including libclang, a C/C++
+compiler, and MozJPEG/HarfBuzz build support). This is developer setup only:
+
+```sh
+CARGO_HOME=/path/to/compressor-cache cargo install compress-pdf --version 0.1.0 --locked --root /path/to/compressor-build
+python3 scripts/collect-compressor-notices.py /path/to/compressor-cache/registry/src/REGISTRY/compress-pdf-0.1.0 /path/to/complete-compressor-notices
+python3 scripts/stage-compressor.py /path/to/compressor-build/bin/compress-pdf --notices /path/to/complete-compressor-notices
+```
+
+The notice collector requires Python 3.11+ and a fresh output directory; replace
+`REGISTRY` with Cargo's registry cache directory. On Windows set `CARGO_HOME` using
+the shell's environment syntax and use `compress-pdf.exe`. Supply the crate's MIT license plus all notices
+for the exact Rust and native dependencies in its locked build, including MozJPEG
+and HarfBuzz. The compressor runs in a separate, cancellable process and is
+included in the existing engine resources. The bundle check verifies its version,
+hash and notices. Mac arm64 has been exercised locally; Windows staging and
+clean-machine compatibility must be verified on that target before distributing.
+
 Install dependencies with `npm ci`. Run `npm run release` to build the installer,
 signed update artifact, and `latest.json`. Output is in `releases/<version>/`.
 Build on the native Mac or Windows architecture; the collection script does not

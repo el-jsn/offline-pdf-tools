@@ -39,7 +39,7 @@ fn supplied_pdf_through_four_operations() {
         if operation == "compress" {
             let balanced = tempfile::Builder::new().suffix(".pdf").tempfile_in(&root).unwrap();
             copy_into(output.path(),balanced.as_file(),Some(&cancel)).unwrap();
-            optimize_images(&engine,&balanced,&root,Compression::Balanced,document.pages as usize,None,&cancel).unwrap();
+            compression::optimize(&engine,&balanced,&root,Compression::Balanced,document.pages as usize,None,&cancel).unwrap();
             validate_output(&engine,balanced.path(),document.pages as usize,&cancel).unwrap();
             balanced.persist_noclobber(root.join("balanced.pdf")).unwrap();
         }
@@ -51,7 +51,7 @@ fn supplied_pdf_through_four_operations() {
 
 #[test]
 #[ignore = "Requires the staged synthetic large scan"]
-fn cancel_running_image_worker_and_reuse_engine() {
+fn cancel_running_compressor_and_reuse_engine() {
     let root=check_root(); let input=root.join("Large-scans.pdf"); let engine=engine_path();
     let before=digest(&input,None).unwrap(); let directory=tempfile::tempdir_in(&root).unwrap();
     let output=tempfile::Builder::new().suffix(".pdf").tempfile_in(directory.path()).unwrap();
@@ -60,14 +60,14 @@ fn cancel_running_image_worker_and_reuse_engine() {
     let trigger=thread::spawn(move || {
         let started=Instant::now();
         while started.elapsed()<Duration::from_secs(20) {
-            let ready=fs::read_dir(&work).unwrap().flatten().any(|entry| entry.path().join("operation.json").exists());
+            let ready=fs::read_dir(&work).unwrap().flatten().any(|entry| entry.path().join("input.pdf").exists());
             if ready { thread::sleep(Duration::from_millis(600)); signal.store(true,Ordering::Relaxed); return; }
             thread::sleep(Duration::from_millis(20));
         }
         signal.store(true,Ordering::Relaxed);
     });
     let start=Instant::now();
-    let result=optimize_images(&engine,&output,directory.path(),Compression::Balanced,20,None,&cancel);
+    let result=compression::optimize(&engine,&output,directory.path(),Compression::Balanced,20,None,&cancel);
     trigger.join().unwrap(); assert!(result.unwrap_err().starts_with("Cancelled")); assert!(start.elapsed()<Duration::from_secs(15));
     assert!(digest(&input,None).unwrap()==before,"Original changed");
     assert_eq!(count_pages(&engine,&input,None).unwrap(),20);

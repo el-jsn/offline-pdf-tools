@@ -15,7 +15,7 @@ fn resolve<'a>(all: &'a Map<String, Value>, value: &'a Value) -> &'a Value {
         .and_then(|object| object.get("value"))
         .unwrap_or(value)
 }
-fn values(index: &Value) -> Result<Vec<String>, String> {
+pub(super) fn values(index: &Value) -> Result<Vec<String>, String> {
     let fields = index
         .pointer("/acroform/fields")
         .and_then(Value::as_array)

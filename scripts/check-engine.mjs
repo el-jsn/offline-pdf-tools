@@ -21,11 +21,19 @@ try {
   const version = execFileSync(executable, ['--version'], { encoding: 'utf8', timeout: 10000, windowsHide: true });
   const match = version.match(/qpdf version (\d+)\.(\d+)/);
   if (!match || Number(match[1]) < 12 || (Number(match[1]) === 12 && Number(match[2]) < 1)) throw new Error('Bundled qpdf must be version 12.1 or newer.');
+  const compressorName = process.platform === 'win32' ? 'compress-pdf.exe' : 'compress-pdf';
+  const compressor = join(directory, compressorName);
+  if (manifest.compressor?.version !== '0.1.0' || !manifest.files[compressorName] || !existsSync(compressor)
+      || !Object.keys(manifest.files).some((name) => name.startsWith('licenses/compress-pdf/'))) {
+    throw new Error('Missing bundled compress-pdf 0.1.0 or its notices. Run scripts/stage-compressor.py before building.');
+  }
+  const compressorVersion = execFileSync(compressor, ['--version'], { encoding: 'utf8', timeout: 10000, windowsHide: true }).trim();
+  if (compressorVersion !== 'compress-pdf 0.1.0') throw new Error('Unexpected bundled compressor version. Restage compress-pdf 0.1.0.');
   const worker = join(directory, process.platform === 'win32' ? 'pdf-image-worker.exe' : 'pdf-image-worker');
   const pdfium = join(directory, process.platform === 'win32' ? 'pdfium.dll' : 'libpdfium.dylib');
   if (!manifest.pdfium || !existsSync(worker) || !existsSync(pdfium)) throw new Error('Missing PDFium image runtime or worker.');
   execFileSync(worker, ['--check-runtime', pdfium], { encoding: 'utf8', timeout: 10000, windowsHide: true });
-  console.log('Bundled PDF and image engines verified.');
+  console.log('Bundled PDF, compression and image engines verified.');
 } catch (error) {
   console.error(error.message);
   process.exit(1);

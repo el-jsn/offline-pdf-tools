@@ -6,6 +6,7 @@ mod size_split;
 mod destination;
 mod diagnostics;
 mod forms;
+mod compression;
 #[cfg(test)]
 mod acceptance;
 use serde::{Deserialize, Serialize};
@@ -51,7 +52,7 @@ struct Features {
     needs_appearances: bool, unsupported_forms: bool,
     bookmarks: Vec<Bookmark>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct Bookmark { title: String, page: Option<u32>, children: Vec<Bookmark> }
 
 struct Store {
@@ -599,83 +600,6 @@ fn image_runtime(engine: &Path) -> Result<(PathBuf, PathBuf), String> {
         return Err("The image engine is missing. Install a complete copy of PDF Tools.".into());
     }
     Ok((worker, library))
-}
-fn optimize_images(
-    engine: &Path,
-    output: &tempfile::NamedTempFile,
-    workspace: &Path,
-    compression: Compression,
-    pages: usize,
-    tuning: Option<(u8, u32)>,
-    cancel: &AtomicBool,
-) -> Result<(), String> {
-    diagnostics::stage("Compress images");
-    let (worker, library) = image_runtime(engine)?;
-    let directory = tempfile::Builder::new()
-        .prefix("images-")
-        .tempdir_in(workspace)
-        .map_err(|_| "Cannot create an image workspace.")?;
-    let index = directory.path().join("index.json");
-    let mut prefix = std::ffi::OsString::from("--json-stream-prefix=");
-    prefix.push(directory.path().join("stream"));
-    checked(
-        Command::new(engine)
-            .args(["--json-output=2", "--json-stream-data=file"])
-            .arg(prefix)
-            .arg(output.path())
-            .arg(&index),
-        Some(cancel),
-    )?;
-    let patch = directory.path().join("patch.json");
-    let config = directory.path().join("operation.json");
-    let operation = serde_json::json!({
-        "library": library, "document": output.path(), "index": index, "patch": patch,
-        "quality": tuning.map(|t| t.0), "dpi": tuning.map(|t| t.1),
-        "directory": directory.path(), "preset": if compression == Compression::Balanced { "balanced" } else { "small" },
-    });
-    fs::write(
-        &config,
-        serde_json::to_vec(&operation).map_err(|_| "Cannot prepare image compression.")?,
-    )
-    .map_err(|_| "Cannot prepare image compression.")?;
-    let result = checked(Command::new(worker).arg(config), Some(cancel)).map_err(|error| {
-        if error.starts_with("Cancelled") {
-            error
-        } else {
-            "Image compression could not finish. No output was saved.".into()
-        }
-    })?;
-    let stats: serde_json::Value =
-        serde_json::from_slice(&result).map_err(|_| "Invalid image compression result.")?;
-    let images = stats["images"]
-        .as_u64()
-        .ok_or("Invalid image compression result.")?;
-    if images == 0 {
-        return Ok(());
-    }
-    let candidate = tempfile::Builder::new()
-        .suffix(".pdf")
-        .tempfile_in(directory.path())
-        .map_err(|_| "Cannot create compressed output.")?;
-    let mut update = std::ffi::OsString::from("--update-from-json=");
-    update.push(patch);
-    checked(
-        Command::new(engine)
-            .arg(update)
-            .args(["--object-streams=generate", "--compression-level=9"])
-            .arg(output.path())
-            .arg(candidate.path()),
-        Some(cancel),
-    )?;
-    let size = validate_output(engine, candidate.path(), pages, cancel)?;
-    if size
-        < fs::metadata(output.path())
-            .map_err(|_| "Cannot inspect output size.")?
-            .len()
-    {
-        copy_into(candidate.path(), output.as_file(), Some(cancel))?;
-    }
-    Ok(())
 }
 
 fn navigation_documents(documents: &[Selected], filename_bookmarks: bool) -> Vec<Selected> {
@@ -1227,19 +1151,19 @@ async fn process_documents(
                 size = validate_output(&engine, output.path(), expected, &cancel)?;
             }
             if request.operation == Operation::Compress && request.compression != Compression::Lossless {
-                progress(&on_progress, format!("Compressing images in PDF {} of {jobs}...", index + 1), true);
+                progress(&on_progress, format!("Compressing PDF {} of {jobs}...", index + 1), true);
                 if let Some(target) = request.target_bytes {
                     let baseline = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot prepare compression.")?;
                     copy_into(output.path(), baseline.as_file(), Some(&cancel))?;
-                    for tuning in [(80,300),(78,240),(75,200),(70,150)] {
+                    for &tuning in compression::tunings(request.compression) {
                         if size <= target { break; }
                         let attempt = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot prepare compression.")?;
                         copy_into(baseline.path(), attempt.as_file(), Some(&cancel))?;
-                        optimize_images(&engine, &attempt, workspace.path(), request.compression, expected, Some(tuning), &cancel)?;
+                        compression::optimize(&engine, &attempt, workspace.path(), request.compression, expected, Some(tuning), &cancel)?;
                         let attempt_size = validate_output(&engine, attempt.path(), expected, &cancel)?;
                         if attempt_size < size { copy_into(attempt.path(), output.as_file(), Some(&cancel))?; size = attempt_size; }
                     }
-                } else { optimize_images(&engine, &output, workspace.path(), request.compression, expected, None, &cancel)?; }
+                } else { compression::optimize(&engine, &output, workspace.path(), request.compression, expected, None, &cancel)?; }
                 size = validate_output(&engine, output.path(), expected, &cancel)?;
             }
             if request.operation == Operation::Compress && !documents[index].features.signatures && !recovered_inputs[index] && size >= fs::metadata(snapshots[index].path()).map_err(|_| "Working copy unavailable.")?.len() {
