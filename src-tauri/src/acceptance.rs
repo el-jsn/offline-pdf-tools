@@ -140,3 +140,36 @@ fn combined_output_can_exceed_input_limit() {
     copy_output(input.path(),output.as_file(),None).unwrap();
     assert_eq!(output.as_file().metadata().unwrap().len(),MAX_BYTES+65536);
 }
+
+#[test]
+#[ignore = "Requires explicitly generated synthetic signature fixtures"]
+fn synthetic_signature_compression_policy() {
+    let root = check_root();
+    let engine = engine_path();
+    let cancel = AtomicBool::new(false);
+    let directory = tempfile::tempdir().unwrap();
+    for (name, signed, forms) in [("signed.pdf", true, true), ("empty-signature.pdf", false, true), ("drawn-signature.pdf", false, false)] {
+        let source = root.join(name);
+        let original = digest(&source, None).unwrap();
+        let document = inspect(&engine, &source, None).unwrap();
+        assert_eq!(document.features.signatures, signed, "{name}");
+        assert_eq!(document.features.forms, forms, "{name}");
+        for acknowledged in [false, true] {
+            assert_eq!(signature_policy(false, signed, acknowledged).is_err(), signed);
+        }
+        if !signed {
+            for preset in [Compression::Balanced, Compression::Small] {
+                let output = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+                checked(Command::new(&engine).args(["--remove-unreferenced-resources=yes", "--object-streams=generate", "--compress-streams=y", "--recompress-flate", "--compression-level=9"]).arg(&source).arg(output.path()), Some(&cancel)).unwrap();
+                compression::optimize(&engine, &output, directory.path(), preset, document.pages as usize, None, &cancel).unwrap();
+                validate_output(&engine, output.path(), document.pages as usize, &cancel).unwrap();
+                let after = inspect_features(&engine, output.path(), None).unwrap();
+                assert!(!after.signatures);
+                assert_eq!(after.forms, forms);
+                let output_name = format!("{}-{}.pdf", name.trim_end_matches(".pdf"), if matches!(preset, Compression::Balanced) { "balanced" } else { "smaller" });
+                output.persist_noclobber(root.join(output_name)).unwrap();
+            }
+        }
+        assert_eq!(digest(&source, None).unwrap(), original, "Original changed: {name}");
+    }
+}

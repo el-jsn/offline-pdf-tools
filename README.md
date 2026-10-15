@@ -9,7 +9,7 @@ Documents are never uploaded.
 - Compress individually or in batches: Balanced by default, with Original quality and Smaller options.
 - Balanced and Smaller use the bundled compress-pdf engine to optimize images, embedded fonts, and PDF structure.
 - Compression accounts for shared-image placements. Merge, Split, and Organize remove unused page resources and pack PDF objects without changing page drawing instructions.
-- See the actual compressed size before saving and compare the original and compressed pages. Set an optional limit per PDF; an unmet limit is identified. Saving uses the measured output.
+- Choose a preset and click Compress PDF, then review the actual output size or compare pages before clicking Save PDF. Set an optional limit per PDF; an unmet limit is identified. Saving uses the already compressed output.
 - Preview source PDFs in all four tools with page navigation and zoom. Organize previews follow the current page order and rotations.
 - Organize pages with group dragging, edge scrolling, keyboard selection, previews, rotation, duplication, removal, undo/redo, and moves to a specific position.
 - Split with thumbnail selection, named page groups, fixed groups, file size limits, every page, bookmarks, or page split points. Extract selected pages together or separately, combine custom groups, and preview output page lists.
@@ -72,7 +72,7 @@ existing private update key; it is not committed to this repository. See
 - Up to 20,000 pages per operation and 500 split outputs.
 - Previews support selected files up to 250 MB using local range reads. Complex PDFs can still exceed rendering memory limits.
 - Encrypted PDFs that open without a password are accepted. Other encrypted PDFs require a supplied password; output copies are unencrypted. Ordinary form fields can be preserved during compression or explicitly flattened for page operations. XFA forms and forms requiring regenerated appearances are unsupported for page operations.
-- Digital signatures cannot be preserved through processing. A changed copy requires explicit acknowledgement; originals remain untouched.
+- Digitally signed PDFs cannot be compressed without invalidating their signatures, so compression requires an unsigned copy. Empty signature fields are not treated as signed. Page operations require explicit acknowledgement of signature removal; originals remain untouched.
 - Compare supports up to 500 pages, 1,000,000 extracted characters, and 200,000 tokens per PDF. It ignores whitespace and page breaks; it does not compare form-field values, images, annotations, formatting, or signatures. PDFs without readable text require OCR in another application. Pages with no extracted text are identified; their visual content is not verified. Large differences may be grouped into a single passage. PDF text extraction order can affect results.
 - Organize page checks support up to 500 pages. Blank detection uses a small rendered page and extracted text. Duplicate suggestions match the rendered preview dimensions, pixels, and extracted text, not the complete PDF objects. Small marks can be missed; all findings require visual review.
 - Page bookmarks are remapped to retained pages. Bookmarks without a resolvable page destination can be omitted. Merging retains attachments with distinct prefixes. Changed page layouts can discard named destinations, XMP metadata, and accessibility tags. Accessibility tag changes show a notice; digital signature removal requires confirmation.

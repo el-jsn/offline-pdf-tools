@@ -25,10 +25,9 @@ const tools = {
 const state = Object.fromEntries(Object.keys(tools).map((tool) => [tool, {
   documents: [], importErrors: [], pages: [], selected: new Set(), history: [], future: [], pageWindow: 0,
   outputLabels: {}, review: null, comparison: null, mergeBookmarks: false,
-  compressionPreview: null, measurementKey: null, measurementFailed: false, compression: 'balanced', targetSize: '', splitMode: 'selected', splitSize: '10', groupSize: '5', ranges: '', splitGroups: [''], splitNames: [''], activeGroup: 0, splitSeparate: false, splitCombine: false, splitCuts: '', flattenForms: false, acknowledgeChanges: false, result: null, errorDetails: null,
+  compressionPreview: null, compression: 'balanced', targetSize: '', splitMode: 'selected', splitSize: '10', groupSize: '5', ranges: '', splitGroups: [''], splitNames: [''], activeGroup: 0, splitSeparate: false, splitCombine: false, splitCuts: '', flattenForms: false, acknowledgeChanges: false, result: null, errorDetails: null,
 }]));
 let mode = 'merge'; let busy = false; let ready = false; let jobId = null; let cancelAvailable = false; let lastSelected = null;
-let compressionTimer = null;
 let previewSession = null;
 let previewRenderSequence = 0;
 let pendingUnlock = null;
@@ -66,12 +65,13 @@ function changesFor(view) {
   const docs = outputDocuments(view).filter((doc) => !doc.locked);
   const any = (test) => docs.some((doc) => test(doc.features));
   const blocked = any((features) => features.unsupportedForms) ? 'XFA forms are unsupported. Print or export a flattened copy, then add it again.'
+    : !pageOperation && any((features) => features.signatures) ? 'This PDF is digitally signed. Compression would invalidate its signature. Use an unsigned copy to compress.'
     : null;
   const flatten = !blocked && pageOperation && any((features) => features.forms);
   const acknowledge = !blocked && any((features) => features.signatures);
   const notes = [];
   if (flatten) notes.push('Forms and annotations will become static.');
-  if (any((features) => features.signatures)) notes.push('Signatures will be removed in the saved copy.');
+  if (!blocked && any((features) => features.signatures)) notes.push('Signatures will be removed in the saved copy.');
   if (pageOperation && any((features) => features.tags)) notes.push('Page changes may remove accessibility tags.');
   return { blocked, flatten, acknowledge, notes };
 }
@@ -98,7 +98,7 @@ function validation() {
 }
 function controls() {
   const view = current();
-  $('save').disabled = busy || !ready || !validation() || (mode === 'compress' && !view.compressionPreview && !view.measurementFailed); $('clear').disabled = busy;
+  $('save').disabled = busy || !ready || !validation(); $('clear').disabled = busy;
   $('app-update').disabled = busy || updateChecking;
   $('app-update').classList.toggle('update-available', Boolean(availableUpdateVersion));
   $('app-update').textContent = availableUpdateVersion ? 'Update available' : 'Check for updates';
@@ -407,7 +407,7 @@ function render() {
   else { $('documents').hidden = false; document.querySelector('.section-heading').hidden = false; }
   renderPageReview(); renderContinuation(); renderInspector();
   renderChanges(); renderImportErrors();
-  controls(); scheduleCompression();
+  controls();
 }
 async function cleanRegistry() {
   const ids = [...new Set(Object.values(state).flatMap((view) => view.documents.map((doc) => doc.id)))];
@@ -580,20 +580,20 @@ try {
 function invalidateCompression() {
   if (mode !== 'compress') return;
   const view = current();
-  view.compressionPreview = null; view.measurementKey = null; view.measurementFailed = false;
+  view.compressionPreview = null; view.result = null;
 }
 function compressionSummary() {
   const view = state.compress; const host = $('compression-size');
-  host.hidden = mode !== 'compress' || !view.documents.length;
+  host.hidden = mode !== 'compress' || !view.documents.length || !view.compressionPreview;
   const measured = view.compressionPreview;
   if (!measured) {
     host.removeAttribute('title');
-    host.classList.remove('invalid'); host.textContent = !validation() ? '' : view.measurementFailed ? 'Size unavailable' : 'Calculating output size...';
+    host.classList.remove('invalid'); host.textContent = '';
     return;
   }
   const saved = measured.inputBytes - measured.outputBytes;
   const percent = measured.inputBytes > 0 ? Math.round(saved / measured.inputBytes * 100) : 0;
-  host.textContent = saved > 0 ? `Expected output: ${bytes(measured.outputBytes)}, saves ${bytes(saved)} (${percent}%)` : `Expected output: ${bytes(measured.outputBytes)}, already optimized`;
+  host.textContent = saved > 0 ? `Output: ${bytes(measured.outputBytes)}, saves ${bytes(saved)} (${percent}%)` : `Output: ${bytes(measured.outputBytes)}, already optimized`;
   const limit = targetBytes(view);
   if (limit) {
     const over = measured.fileBytes.filter((size) => size > limit).length;
@@ -602,19 +602,10 @@ function compressionSummary() {
   host.classList.toggle('invalid', Boolean(limit && measured.fileBytes.some((size) => size > limit)));
   host.title = `${measured.outputBytes.toLocaleString()} bytes${measured.files > 1 ? ' total' : ''}`;
 }
-function scheduleCompression() {
-  clearTimeout(compressionTimer);
+async function compressDocuments() {
   if (mode !== 'compress' || busy || !ready || !current().documents.length || !validation()) return;
   const view = current();
-  const key = JSON.stringify([view.compression, view.targetSize, view.acknowledgeChanges, view.documents.map((doc) => doc.id)]);
-  if (view.measurementKey === key) return;
-  compressionTimer = setTimeout(() => measureCompression(key), 250);
-}
-async function measureCompression(key) {
-  if (mode !== 'compress' || busy || !ready || !current().documents.length || !validation()) return;
-  const view = current();
-  if (key !== JSON.stringify([view.compression, view.targetSize, view.acknowledgeChanges, view.documents.map((doc) => doc.id)])) return;
-  view.measurementKey = key; view.measurementFailed = false; view.compressionPreview = null; view.errorDetails = null;
+  view.compressionPreview = null; view.result = null; view.errorDetails = null;
   busy = true; cancelAvailable = false; jobId = crypto.randomUUID(); controls();
   const onProgress = new Channel();
   onProgress.onmessage = (progress) => { message(progress.message); cancelAvailable = progress.cancellable; controls(); };
@@ -622,6 +613,7 @@ async function measureCompression(key) {
     const preview = await invoke('process_documents', {
       request: { jobId, operation: 'compress', ids: view.documents.map((doc) => doc.id), compression: view.compression, targetBytes: targetBytes(view), acknowledgeChanges: view.acknowledgeChanges, measureOnly: true }, onProgress,
     });
+    if (!preview) { message('Compression cancelled.'); return; }
     view.compressionPreview = preview;
     compressionSummary();
     if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
@@ -629,7 +621,6 @@ async function measureCompression(key) {
     }
     message(view.compressionPreview.recovered ? 'Ready to save. PDF data recovered; review the saved copy.' : 'Ready to save');
   } catch (error) {
-    view.measurementFailed = true;
     processingError(view, error);
   } finally {
     busy = false; jobId = null; cancelAvailable = false; render();
@@ -637,7 +628,8 @@ async function measureCompression(key) {
 }
 async function save() {
   if (mode === 'compare') { await compareDocuments(); return; }
-  if (busy || !ready || !validation() || (mode === 'compress' && !current().compressionPreview && !current().measurementFailed)) return;
+  if (busy || !ready || !validation()) return;
+  if (mode === 'compress' && !current().compressionPreview) { await compressDocuments(); return; }
   busy = true; cancelAvailable = false; const activeMode = mode; const view = current(); jobId = crypto.randomUUID();
   view.errorDetails = null;
   const onProgress = new Channel(); onProgress.onmessage = (progress) => { message(progress.message); cancelAvailable = progress.cancellable; controls(); };
@@ -1030,7 +1022,7 @@ async function automaticUpdateCheck(installedVersion) {
 }
 $('app-update').addEventListener('click', async () => {
   if (busy || updateChecking) return;
-  clearTimeout(compressionTimer); busy = true; cancelAvailable = false; controls();
+  busy = true; cancelAvailable = false; controls();
   try {
     if (availableUpdateVersion) {
       if (!pendingUpdate) await fetchUpdate();
@@ -1046,7 +1038,7 @@ $('app-update').addEventListener('click', async () => {
     }
   } catch (error) {
     pendingUpdate = null; message(String(error), String(error).startsWith('No update') ? '' : 'error');
-  } finally { busy = false; controls(); scheduleCompression(); }
+  } finally { busy = false; controls(); }
 });
 $('release-notes').addEventListener('click', async () => {
   if (busy) return;

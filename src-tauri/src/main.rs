@@ -382,13 +382,36 @@ fn bookmarks(values: &serde_json::Value) -> Vec<Bookmark> {
         children: bookmarks(&item["kids"]),
     }).collect()).unwrap_or_default()
 }
+fn signature_policy(page_operation: bool, signed: bool, acknowledged: bool) -> Result<(), String> {
+    if signed && !page_operation {
+        return Err("This PDF is digitally signed. Compression would invalidate its signature. Use an unsigned copy to compress.".into());
+    }
+    if signed && !acknowledged {
+        return Err("Confirm digital signature removal before saving.".into());
+    }
+    Ok(())
+}
+// qpdf reports empty /Sig fields too. Only populated values or signature
+// permissions indicate a signature that rewriting the PDF could invalidate.
+fn has_signatures(fields: &[serde_json::Value], catalog: &serde_json::Value, objects: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let populated = |value: &serde_json::Value| !value.is_null() && value.as_str().is_none_or(|text| !matches!(text, "" | "u:" | "b:"));
+    if fields.iter().any(|field| field["fieldtype"] == "/Sig" && populated(&field["value"])) {
+        return true;
+    }
+    let permissions = &catalog["/Perms"];
+    let permissions = permissions.as_str()
+        .and_then(|reference| objects.get(&format!("obj:{reference}")))
+        .and_then(|object| object.get("value"))
+        .unwrap_or(permissions);
+    ["/DocMDP", "/UR", "/UR3"].iter().any(|key| populated(&permissions[*key]))
+}
 fn inspect_features(engine: &Path, path: &Path, cancel: Option<&AtomicBool>) -> Result<Features, String> {
     let json = inspect_json(engine, path, cancel)?;
     let objects = json.pointer("/qpdf/1").and_then(|v| v.as_object()).ok_or("Cannot inspect document structure.")?;
     let root = objects.get("trailer").and_then(|v| v.pointer("/value/~1Root")).and_then(|v| v.as_str()).ok_or("Cannot inspect document catalog.")?;
     let catalog = objects.get(&format!("obj:{root}")).and_then(|v|v.get("value")).ok_or("Cannot inspect document catalog.")?;
     let fields = json.pointer("/acroform/fields").and_then(|v| v.as_array()).ok_or("Cannot inspect forms.")?;
-    let signatures = fields.iter().any(|field| field["fieldtype"] == "/Sig") || catalog.get("/Perms").is_some();
+    let signatures = has_signatures(fields, catalog, objects);
     Ok(Features {
         forms: !fields.is_empty(), signatures, tags: catalog.get("/StructTreeRoot").is_some(),
         attachments: json["attachments"].as_object().map_or(0, |items| items.len()),
@@ -1014,7 +1037,7 @@ async fn process_documents(
         if documents.iter().any(|doc| doc.features.unsupported_forms) { return Err("XFA forms are unsupported. Use a flattened copy.".into()); }
         let page_operation = request.operation != Operation::Compress;
         if page_operation && documents.iter().any(|doc| doc.features.forms) && !request.flatten_forms { return Err("Select Flatten forms before saving.".into()); }
-        if documents.iter().any(|doc| doc.features.signatures) && !request.acknowledge_changes { return Err("Confirm digital signature removal before saving.".into()); }
+        signature_policy(page_operation, documents.iter().any(|doc| doc.features.signatures), request.acknowledge_changes)?;
         diagnostics::inputs(documents.iter().map(|document|(document.bytes,document.pages)));
         let engine = engine(&app)?; check_version(&engine)?;
         let suffix = match request.operation { Operation::Merge => "merged", Operation::Compress => "compressed", Operation::Split => "split", Operation::Organize => "organized" };
@@ -1077,7 +1100,7 @@ async fn process_documents(
             if let Some(id) = &request.preview_id {
                 let preview = store.compression_preview.lock().map_err(|_| "Compression preview is unavailable.")?
                     .as_ref().filter(|preview| &preview.id == id && preview.ids == request.ids && preview.compression == request.compression && preview.target_bytes == request.target_bytes)
-                    .cloned().ok_or("Compression settings changed. Wait for the new size measurement.")?;
+                    .cloned().ok_or("Compression settings changed. Compress the PDF again.")?;
                 Some(preview)
             } else { None }
         } else { None };
@@ -1093,7 +1116,7 @@ async fn process_documents(
             if let Some(preview) = &cached {
                 copy_into(preview.outputs[index].path(), output.as_file(), Some(&cancel))?;
                 if digest(output.path(), Some(&cancel))? != preview.digests[index] {
-                    return Err("The measured output changed. Check compression again.".into());
+                    return Err("The compressed output changed. Compress the PDF again.".into());
                 }
                 output_bytes += preview.sizes[index]; sizes.push(preview.sizes[index]); outputs.push(output);
                 continue;
@@ -1545,6 +1568,28 @@ fn main() {
 #[cfg(test)]
 mod stream_repair_tests {
     use super::*;
+    #[test]
+    fn signature_policy_never_rewrites_signed_compression() {
+        for acknowledged in [false, true] {
+            assert!(signature_policy(false, true, acknowledged).unwrap_err().contains("invalidate its signature"));
+            assert!(signature_policy(false, false, acknowledged).is_ok());
+        }
+        assert!(signature_policy(true, true, false).is_err());
+        assert!(signature_policy(true, true, true).is_ok());
+    }
+    #[test]
+    fn signature_detection_distinguishes_empty_fields_from_signed_values() {
+        use serde_json::json;
+        let objects = serde_json::Map::new();
+        for value in [json!(null), json!(""), json!("u:"), json!("b:")] {
+            assert!(!has_signatures(&[json!({"fieldtype": "/Sig", "value": value})], &json!({}), &objects));
+        }
+        assert!(!has_signatures(&[json!({"fieldtype": "/Sig"})], &json!({"/Perms": {}}), &objects));
+        assert!(has_signatures(&[json!({"fieldtype": "/Sig", "value": "12 0 R"})], &json!({}), &objects));
+        assert!(has_signatures(&[], &json!({"/Perms": {"/DocMDP": "12 0 R"}}), &objects));
+        let objects = json!({"obj:11 0 R": {"value": {"/UR3": "12 0 R"}}}).as_object().unwrap().clone();
+        assert!(has_signatures(&[], &json!({"/Perms": "11 0 R"}), &objects));
+    }
     const CONTENT: &[u8] = b"BT /F1 12 Tf 72 720 Td (Synthetic credit report fixture) Tj ET\n";
     const DAMAGED: &[u8] = &[120,156,114,10,81,208,119,51,84,48,52,82,8,73,83,48,55,2,34,3,133,144,20,5,141,224,202,188,146,140,212,146,204,100,133,228,162,212,148,204,18,133,162,212,130,252,162,18,133,180,204,138,146,210,162,84,77,133,144,44,5,215,16,46,0,0,0,0,255,255];
     const VALID: &[u8] = &[120,156,115,10,81,208,119,51,84,48,52,82,8,73,83,48,55,2,34,3,133,144,20,5,141,224,202,188,146,140,212,146,204,100,133,228,162,212,148,204,18,133,162,212,130,252,162,18,133,180,204,138,146,210,162,84,77,133,144,44,5,215,16,46,0,51,230,19,31];
