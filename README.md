@@ -1,6 +1,6 @@
 # PDF Tools
 
-A desktop utility for merging, compressing, splitting, and organizing PDFs locally.
+A desktop utility for merging, compressing, splitting, organizing, and comparing PDFs locally.
 Documents are never uploaded.
 
 ## Features
@@ -15,6 +15,12 @@ Documents are never uploaded.
 - Split with thumbnail selection, named page groups, fixed groups, file size limits, every page, bookmarks, or page split points. Extract selected pages together or separately, combine custom groups, and preview output page lists.
 - Choose System, Light, or Dark appearance in the sidebar.
 - Add files through drag and drop or the file picker. Invalid or unsupported files are listed individually; valid files in the same batch remain available.
+- Keep an optional page preview beside the working list. Small windows show it over the workspace; full preview remains resizable.
+- Review split outputs by cover, page range, and editable filename. Merge can create document bookmarks from filenames, retaining existing bookmarks beneath them.
+- Save named upload limits and remember compression settings and thumbnail size. These settings contain no document content or paths. Size displays and upload limits use decimal MB.
+- Continue from saved outputs into another tool without choosing those files again. Only the recorded output files are imported, up to 100 at a time.
+- Check Organize pages for possible blanks and duplicates. Findings are review suggestions; pages are never removed automatically.
+- Compare the extracted page text of an original and revised PDF, review changed passages, and open their source pages. Comparison runs locally and supports cancellation.
 
 Original files are preserved. Outputs are saved as new files.
 
@@ -63,6 +69,8 @@ existing private update key; it is not committed to this repository. See
 - Previews support selected files up to 250 MB using local range reads. Complex PDFs can still exceed rendering memory limits.
 - Encrypted PDFs that open without a password are accepted. Other encrypted PDFs require a supplied password; output copies are unencrypted. Ordinary form fields can be preserved during compression or explicitly flattened for page operations. XFA forms and forms requiring regenerated appearances are unsupported for page operations.
 - Digital signatures cannot be preserved through processing. A changed copy requires explicit acknowledgement; originals remain untouched.
+- Compare supports up to 500 pages, 1,000,000 extracted characters, and 200,000 tokens per PDF. It ignores whitespace and page breaks; it does not compare form-field values, images, annotations, formatting, or signatures. PDFs without readable text require OCR in another application. Pages with no extracted text are identified; their visual content is not verified. Large differences may be grouped into a single passage. PDF text extraction order can affect results.
+- Organize page checks support up to 500 pages. Blank detection uses a small rendered page and extracted text. Duplicate suggestions match the rendered preview dimensions, pixels, and extracted text, not the complete PDF objects. Small marks can be missed; all findings require visual review.
 - Page bookmarks are remapped to retained pages. Bookmarks without a resolvable page destination can be omitted. Merging retains attachments with distinct prefixes. Changed page layouts can discard named destinations, XMP metadata, and accessibility tags; accessibility changes require acknowledgement.
 
 Input PDFs with recoverable compressed-stream warnings are repaired in a temporary

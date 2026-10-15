@@ -8,20 +8,23 @@ import { Previews } from './previews.js';
 import { splitPlan, parseRange, pageList, movePagesTo, movePagesBeside, bookmarkGroups, pageKey } from './model.js';
 import { UpdateChecks } from './updates.js';
 import './styles.css';
+import { loadPreferences, savePreferences } from './preferences.js';
 import { setupAppearance } from './appearance.js';
 
 setupAppearance();
 
 const $ = (id) => document.getElementById(id);
-const bytes = (value) => value >= 1048576 ? `${(value / 1048576).toFixed(2)} MB` : `${(value / 1024).toFixed(1)} KB`;
+const bytes = (value) => value >= 1000000 ? `${(value / 1000000).toFixed(2)} MB` : `${(value / 1000).toFixed(1)} KB`;
 const tools = {
   merge: { heading: 'Merge PDFs', action: 'Merge PDFs' },
   compress: { heading: 'Compress PDF', action: 'Compress PDF' },
   split: { heading: 'Split PDF', action: 'Split PDF' },
   organize: { heading: 'Organize pages', action: 'Save PDF' },
+  compare: { heading: 'Compare PDFs', action: 'Compare' },
 };
 const state = Object.fromEntries(Object.keys(tools).map((tool) => [tool, {
   documents: [], importErrors: [], pages: [], selected: new Set(), history: [], future: [], pageWindow: 0,
+  outputLabels: {}, review: null, comparison: null, mergeBookmarks: false,
   compressionPreview: null, measurementKey: null, measurementFailed: false, compression: 'balanced', targetSize: '', splitMode: 'selected', splitSize: '10', groupSize: '5', ranges: '', splitGroups: [''], splitNames: [''], activeGroup: 0, splitSeparate: false, splitCombine: false, splitCuts: '', flattenForms: false, acknowledgeChanges: false, result: null,
 }]));
 let mode = 'merge'; let busy = false; let ready = false; let jobId = null; let cancelAvailable = false; let lastSelected = null;
@@ -33,6 +36,10 @@ let duplicateKey = 0;
 let pendingUpdate = null; let updateChecking = false; let availableUpdateVersion = null;
 let updateStorage; try { updateStorage = window.localStorage; } catch { /* Storage may be unavailable. */ }
 const updateChecks = new UpdateChecks(updateStorage);
+const preferences = loadPreferences(updateStorage);
+state.compress.compression = preferences.compression; state.compress.targetSize = preferences.target;
+let inspectorPage = null, inspectorIndex = 0, inspectorSequence = 0;
+let localCancel = null;
 const PAGE_WINDOW = 48;
 const current = () => state[mode];
 const previews = new Previews();
@@ -44,6 +51,7 @@ function outputDocuments(view) {
   return view.documents.filter((doc) => used.has(doc.id));
 }
 function changesFor(view) {
+  if (mode === 'compare') return { blocked: null, flatten: false, acknowledge: false, notes: [] };
   const pageOperation = mode !== 'compress';
   const docs = outputDocuments(view).filter((doc) => !doc.locked);
   const any = (test) => docs.some((doc) => test(doc.features));
@@ -58,10 +66,10 @@ function changesFor(view) {
   return { blocked, flatten, acknowledge, notes };
 }
 function targetBytes(view) {
-  const mb = Number.parseFloat(view.targetSize);
+  const mb = Number(view.targetSize);
   if (!Number.isFinite(mb) || view.compression === 'lossless') return null;
-  const limit = Math.round(mb * 1048576);
-  return limit >= 100000 && limit <= 250 * 1048576 ? limit : null;
+  const limit = Math.floor(mb * 1000000);
+  return limit >= 100000 && limit <= 250000000 ? limit : null;
 }
 function validation() {
   const view = current();
@@ -70,6 +78,7 @@ function validation() {
   if (changes.blocked) return false;
   if (changes.flatten && !view.flattenForms) return false;
   if (changes.acknowledge && !view.acknowledgeChanges) return false;
+  if (mode === 'compare') return view.documents.length === 2 && new Set(view.documents.map((doc) => doc.compareRole)).size === 2;
   if (mode === 'merge') return view.documents.length >= 2 && view.documents.reduce((sum, doc) => sum + doc.pages, 0) <= 20000;
   if (mode === 'compress') return view.documents.length > 0 && !(view.targetSize.trim() && targetBytes(view) === null);
   if (mode === 'organize') return view.pages.length > 0 && view.pages.length <= 20000;
@@ -86,7 +95,20 @@ function controls() {
   $('app-update').title = availableUpdateVersion ? `Install version ${availableUpdateVersion}` : '';
   $('app-update').setAttribute('aria-label', availableUpdateVersion ? `Update available. Install version ${availableUpdateVersion}` : 'Check for updates');
   $('release-notes').disabled = busy;
-  $('add').disabled = busy || !ready; $('choose').disabled = busy || !ready;
+  $('add').disabled = busy || !ready;
+  $('toggle-inspector').hidden = !view.documents.length;
+  $('toggle-inspector').disabled = busy;
+  $('check-pages').hidden = mode !== 'organize'; $('check-pages').disabled = busy || !view.pages.length;
+  $('merge-bookmarks').disabled = busy;
+  $('save-limit').disabled = busy || !targetBytes(state.compress) || preferences.presets.length >= 12;
+  $('limit-preset').disabled = busy || state.compress.compression === 'lossless';
+  $('delete-limit').disabled = busy;
+  $('swap-documents').disabled = busy || state.compare.documents.length !== 2;
+  for (const button of $('compare-slots').querySelectorAll('button')) button.disabled = busy;
+  $('continue-output').hidden = busy || !view.result;
+  $('organizer-edits').hidden = mode !== 'organize' || !view.selected.size;
+  document.querySelector('.page-more').hidden = mode !== 'organize' || !view.selected.size;
+  for (const button of $('page-review').querySelectorAll('button')) button.disabled = busy; $('choose').disabled = busy || !ready;
   $('busy-indicator').hidden = !busy; $('loaded').setAttribute('aria-busy', String(busy));
   $('cancel').hidden = !busy || !cancelAvailable; $('reveal').hidden = busy || !view.result;
   document.querySelectorAll('.tool, #compression-options input, #split-options input, #split-options select, #split-options button').forEach((control) => { control.disabled = busy; });
@@ -111,7 +133,7 @@ function controls() {
   for (const control of document.querySelectorAll('.file-actions button, .page-actions button')) control.disabled = busy || control.dataset.boundary === 'true';
   $('save-label').textContent = mode === 'split' && view.splitMode === 'selected' ? 'Extract pages' : mode === 'compress' && view.compressionPreview ? (view.documents.length > 1 ? 'Save PDFs' : 'Save PDF') : mode === 'compress' && view.documents.length > 1 ? 'Compress PDFs' : tools[mode].action;
   compressionSummary();
-  $('add-label').textContent = ['merge', 'organize'].includes(mode) ? 'Add files' : mode === 'compress' ? 'Add PDFs' : view.documents.length ? 'Replace PDF' : 'Add PDF';
+  $('add-label').textContent = mode === 'compare' ? 'Choose PDFs' : ['merge', 'organize'].includes(mode) ? 'Add files' : mode === 'compress' ? 'Add PDFs' : view.documents.length ? 'Replace PDF' : 'Add PDF';
 }
 function actionButton(label, symbol, action, disabled = false) {
   const element = document.createElement('button'); element.className = 'icon-button'; element.title = label;
@@ -159,7 +181,7 @@ function renderDocuments() {
   });
 }
 function rememberEdit() {
-  const view = current(); view.history.push(view.pages.map((page) => ({ ...page }))); view.future = [];
+  const view = current(); view.review = null; view.history.push(view.pages.map((page) => ({ ...page }))); view.future = [];
   if (view.history.length > 50) view.history.shift(); view.result = null;
 }
 function updateSelection() {
@@ -169,6 +191,7 @@ function updateSelection() {
   }
   $('organizer-selection').textContent = mode === 'organize' ? `${current().selected.size} selected` : '';
   $('page-selection').textContent = mode === 'split' && current().splitMode === 'ranges' ? `Group ${current().activeGroup + 1}: ${current().selected.size} pages selected` : mode === 'split' && current().splitMode === 'after' ? `${current().selected.size} split points` : mode === 'split' && current().splitMode === 'bookmarks' ? '' : `${current().selected.size} selected`;
+  renderInspector();
   $('select-all').textContent = current().selected.size === current().pages.length ? 'Deselect all' : 'Select all'; controls();
 }
 function renderPages() {
@@ -192,6 +215,7 @@ function renderPages() {
     const paper = document.createElement('div'); paper.className = 'page-paper'; previews.watch(paper, source.id, page.page, page.rotation, source.previewBytes);
     const check = document.createElement('span'); check.className = 'page-check'; check.setAttribute('aria-hidden', 'true');
     const caption = document.createElement('span'); caption.className = 'page-caption'; caption.textContent = `Page ${mode === 'organize' ? position + 1 : page.page}${page.rotation ? `, rotated ${page.rotation} degrees` : ''}`; card.append(paper, check, caption);
+    if (mode === 'organize' && view.documents.length > 1) { const label = document.createElement('span'); label.className = 'page-source'; label.textContent = source.name; label.title = source.name; card.append(label); }
     {
       const actions = document.createElement('div'); actions.className = 'page-actions';
       const preview = actionButton(`Preview page ${page.page}`, 'preview', () => openPreview(page));
@@ -206,6 +230,7 @@ function renderPages() {
         const previous = view.pages.findIndex((item) => pageKey(item) === lastSelected);
         if (previous >= 0) for (let index = Math.min(previous, position); index <= Math.max(previous, position); index += 1) view.selected.add(pageKey(view.pages[index]));
       } else if (view.selected.has(key)) view.selected.delete(key); else view.selected.add(key);
+      inspectorPage = { ...page, documentId: source.id };
       lastSelected = key; if (mode === 'split') writeSplitSelection(); updateSelection();
     };
     card.addEventListener('click', select); card.addEventListener('dblclick', () => openPreview(page));
@@ -241,10 +266,30 @@ function splitPlanFor(view) {
   if (plan.map(pageList).join(';').length > 20000) throw new Error('The page range list is too long.');
   return plan;
 }
-function splitOutputNames(view) {
+function defaultSplitNames(view) {
   if (view.splitMode === 'ranges' && !view.splitCombine) return view.splitGroups.map((_, i) => view.splitNames[i]?.trim() || `Group ${i + 1}`);
   if (view.splitMode !== 'bookmarks') return [];
   try { return bookmarkGroups(view.documents[0].features.bookmarks, view.documents[0].pages).map((group) => group.name); } catch { return []; }
+}
+function splitOutputNames(view) {
+  const defaults = defaultSplitNames(view);
+  if (view.splitMode === 'file_size') return [];
+  return splitPlanFor(view).map((pages, index) => view.outputLabels[`${view.splitMode}:${pages.join(',')}`] ?? defaults[index] ?? `part-${String(index + 1).padStart(3, '0')}`);
+}
+function renderSplitOutputs(plan, names) {
+  const view = current(), doc = view.documents[0];
+  plan.forEach((pages, index) => {
+    const item = document.createElement('li'); item.className = 'split-output';
+    const cover = document.createElement('button'); cover.className = 'output-cover'; cover.setAttribute('aria-label', `Preview output ${index + 1}`);
+    previews.watch(cover, doc.id, pages[0], 0, doc.previewBytes); cover.addEventListener('click', () => openDocumentPreview(doc, pages[0]));
+    const info = document.createElement('div'), label = document.createElement('label'); label.className = 'sr-only'; label.htmlFor = `output-name-${index}`; label.textContent = `Output ${index + 1} filename`;
+    const name = document.createElement('input'); name.id = label.htmlFor; name.type = 'text'; name.maxLength = 80; name.value = names[index];
+    const filename = document.createElement('p'); filename.className = 'output-filename';
+    const update = () => { const cleaned = [...name.value.trim()].filter((c) => !/\p{Cc}/u.test(c) && !'/\\:*?"<>|'.includes(c)).slice(0, 80).join('').replace(/^[ .]+|[ .]+$/g, '') || `part-${String(index + 1).padStart(3, '0')}`; filename.textContent = `${String(index + 1).padStart(3, '0')}-${cleaned}.pdf`; };
+    update(); name.addEventListener('input', () => { view.outputLabels[`${view.splitMode}:${pages.join(',')}`] = name.value; view.result = null; update(); controls(); });
+    const meta = document.createElement('p'); meta.className = 'context-note'; meta.textContent = `${pages.length} ${pages.length === 1 ? 'page' : 'pages'}: ${pageList(pages)}`;
+    info.append(label, name, filename, meta); item.append(cover, info); $('split-output-list').append(item);
+  });
 }
 function readSplitSelection() {
   const view = current();
@@ -287,6 +332,7 @@ function renderSplitGroups() {
 function splitSummary() {
   if (!current().documents.length) return;
   const view = current(); $('split-output-list').replaceChildren(); $('split-summary').hidden = false;
+  if (view.splitMode === 'selected' && !view.ranges.trim()) { $('split-summary').hidden = true; $('split-output-details').hidden = true; controls(); return; }
   for (const input of $('split-options').querySelectorAll('input')) input.removeAttribute('aria-invalid');
   try {
     if (view.splitMode === 'file_size') {
@@ -296,10 +342,7 @@ function splitSummary() {
     const plan = splitPlanFor(view); const used = new Set(plan.flat()).size; const names = splitOutputNames(view);
     $('split-summary').textContent = `${plan.length} ${plan.length === 1 ? 'PDF' : 'PDFs'}, ${plan.flat().length} output pages${used < view.documents[0].pages ? `, ${view.documents[0].pages - used} pages excluded` : ''}.`;
     $('split-summary').className = 'context-note'; $('split-output-details').hidden = false;
-    plan.slice(0, 20).forEach((pages, index) => {
-      const item = document.createElement('li'); item.textContent = `${names[index] || `PDF ${index + 1}`}: ${pages.length} ${pages.length === 1 ? 'page' : 'pages'} (${pageList(pages)})`; $('split-output-list').append(item);
-    });
-    if (plan.length > 20) { const item = document.createElement('li'); item.textContent = `${plan.length - 20} more PDFs`; $('split-output-list').append(item); }
+    renderSplitOutputs(plan, names);
   } catch (error) {
     $('split-summary').textContent = error.message; $('split-summary').className = 'context-note invalid'; $('split-output-details').hidden = true;
     if (view.splitMode === 'ranges') view.splitGroups.forEach((range, index) => { try { parseRange(range, view.documents[0].pages); } catch { $(`split-group-${index}`).setAttribute('aria-invalid', 'true'); } });
@@ -338,6 +381,11 @@ function render() {
   const total = view.documents.reduce((sum, doc) => sum + doc.bytes, 0);
   const pages = mode === 'organize' ? view.pages.length : view.documents.reduce((sum, doc) => sum + doc.pages, 0);
   $('summary').textContent = hasDocuments ? `${view.documents.length} ${view.documents.length === 1 ? 'document' : 'documents'}, ${pages} pages, ${bytes(total)}` : 'No PDFs selected';
+  $('merge-options').hidden = mode !== 'merge'; $('merge-bookmarks').checked = view.mergeBookmarks;
+  $('comparison').hidden = mode !== 'compare';
+  if (mode === 'compare') { $('empty').hidden = true; $('loaded').hidden = false; $('documents').hidden = true; document.querySelector('.section-heading').hidden = true; renderCompareSlots(); if (view.comparison && !$('compare-changes').children.length) renderComparisonChanges(); }
+  else { $('documents').hidden = false; document.querySelector('.section-heading').hidden = false; }
+  renderPageReview(); renderContinuation(); renderInspector();
   renderChanges(); renderImportErrors();
   controls(); scheduleCompression();
 }
@@ -352,7 +400,7 @@ function resetEdits(view) {
 }
 async function removeDocument(id) {
   if (busy) return; busy = true;
-  invalidateCompression(); current().documents = current().documents.filter((doc) => doc.id !== id); current().pages = mode === 'organize' ? current().pages.filter((page) => page.documentId !== id) : []; current().selected.clear(); current().history = []; current().result = null; resetEdits(current()); render();
+  invalidateCompression(); current().documents = current().documents.filter((doc) => doc.id !== id); current().pages = mode === 'organize' ? current().pages.filter((page) => page.documentId !== id) : []; current().selected.clear(); current().history = []; current().result = null; current().review = null; if (mode === 'compare') clearComparison(); resetEdits(current()); render();
   try { await cleanRegistry(); message('Document removed.'); }
   catch (error) { message(String(error), 'error'); }
   finally { busy = false; render(); }
@@ -360,7 +408,16 @@ async function removeDocument(id) {
 async function acceptSelection(selected, insertionIndex) {
   invalidateCompression();
   const view = current();
-  if (['merge', 'compress'].includes(mode)) {
+  if (mode === 'compare') {
+    if (selected.length > 2) throw new Error('Choose two PDFs to compare.');
+    if (selected.length === 2) view.documents = selected.map((doc, index) => ({ ...doc, compareRole: index }));
+    else {
+      if (view.documents.length === 2) throw new Error('Use Replace under Original PDF or Revised PDF.');
+      const role = view.documents.some((doc) => doc.compareRole === 0) ? 1 : 0;
+      view.documents = [...view.documents, { ...selected[0], compareRole: role }].sort((a,b) => a.compareRole - b.compareRole);
+    }
+    clearComparison();
+  } else if (['merge', 'compress'].includes(mode)) {
     let position = insertionIndex ?? view.documents.length;
     for (const doc of selected) {
       const index = view.documents.findIndex((old) => old.id === doc.id);
@@ -385,9 +442,9 @@ async function acceptSelection(selected, insertionIndex) {
     view.documents = selected;
     view.pages = ['organize', 'split'].includes(mode) ? Array.from({ length: selected[0].pages }, (_, index) => ({ page: index + 1, rotation: 0 })) : [];
     view.selected.clear(); view.history = []; view.pageWindow = 0; lastSelected = null;
-    if (mode === 'split') { view.ranges = ''; view.splitGroups = ['']; view.splitNames = ['']; view.activeGroup = 0; view.splitCuts = ''; $('split-ranges').value = ''; $('split-cuts').value = ''; }
+    if (mode === 'split') { view.outputLabels = {}; view.ranges = ''; view.splitGroups = ['']; view.splitNames = ['']; view.activeGroup = 0; view.splitCuts = ''; $('split-ranges').value = ''; $('split-cuts').value = ''; }
   }
-  resetEdits(view); view.result = null;
+  resetEdits(view); view.result = null; view.review = null;
   for (const doc of selected) await previews.forget(doc.id);
   await cleanRegistry();
 }
@@ -424,7 +481,7 @@ function renderImportErrors() {
 async function choose() {
   if (busy || !ready) return; busy = true; controls(); message(['merge', 'organize'].includes(mode) ? 'Select files' : 'Select PDFs');
   try {
-    const result = await invoke('choose_documents', { multiple: ['merge', 'compress', 'organize'].includes(mode), allowImages: ['merge', 'organize'].includes(mode) });
+    const result = await invoke('choose_documents', { multiple: ['merge', 'compress', 'organize', 'compare'].includes(mode), allowImages: ['merge', 'organize'].includes(mode) });
     if (!result.documents.length && !result.rejected.length) { message('Selection cancelled.'); return; }
     current().importErrors = result.rejected; $('import-errors').open = !result.documents.length;
     if (result.documents.length) await acceptSelection(result.documents);
@@ -548,20 +605,21 @@ async function measureCompression(key) {
   }
 }
 async function save() {
+  if (mode === 'compare') { await compareDocuments(); return; }
   if (busy || !ready || !validation() || (mode === 'compress' && !current().compressionPreview && !current().measurementFailed)) return;
   busy = true; cancelAvailable = false; const activeMode = mode; const view = current(); jobId = crypto.randomUUID();
   const onProgress = new Channel(); onProgress.onmessage = (progress) => { message(progress.message); cancelAvailable = progress.cancellable; controls(); };
   controls(); message(mode === 'split' || (mode === 'compress' && view.documents.length > 1) ? 'Select output folder' : 'Select save location');
   try {
     const splitRanges = mode === 'split' ? splitPlanFor(view).map(pageList).join(';') : view.ranges;
-    const result = await invoke('process_documents', { request: { jobId, operation: mode, ids: outputDocuments(view).map((doc) => doc.id), compression: view.compression, previewId: view.compressionPreview?.id ?? null, splitMode: mode === 'split' ? (view.splitMode === 'file_size' ? 'file_size' : 'ranges') : 'every_page', pagesPerFile: Number(view.groupSize), ranges: splitRanges, pages: view.pages.map((page) => ({ documentId: page.documentId || '', page: page.page, rotation: page.rotation })), targetBytes: mode === 'compress' ? targetBytes(view) : null, maxOutputBytes: mode === 'split' && view.splitMode === 'file_size' ? splitSizeBytes(view) : null, outputNames: mode === 'split' ? splitOutputNames(view) : [], flattenForms: view.flattenForms, acknowledgeChanges: view.acknowledgeChanges }, onProgress });
+    const result = await invoke('process_documents', { request: { jobId, operation: mode, ids: outputDocuments(view).map((doc) => doc.id), compression: view.compression, previewId: view.compressionPreview?.id ?? null, splitMode: mode === 'split' ? (view.splitMode === 'file_size' ? 'file_size' : 'ranges') : 'every_page', pagesPerFile: Number(view.groupSize), ranges: splitRanges, pages: view.pages.map((page) => ({ documentId: page.documentId || '', page: page.page, rotation: page.rotation })), targetBytes: mode === 'compress' ? targetBytes(view) : null, maxOutputBytes: mode === 'split' && view.splitMode === 'file_size' ? splitSizeBytes(view) : null, outputNames: mode === 'split' ? splitOutputNames(view) : [], flattenForms: view.flattenForms, acknowledgeChanges: view.acknowledgeChanges, mergeBookmarks: view.mergeBookmarks }, onProgress });
     if (!result) { message('Save cancelled.'); return; } view.result = result;
-    let text = activeMode !== 'split' && result.files === 1 ? `Saved ${result.name}. ${bytes(result.outputBytes)}.` : `Saved ${result.files} PDFs in ${result.name}.`;
+    let text = activeMode !== 'split' && result.files === 1 ? `Saved ${result.name}. ${bytes(result.outputBytes)}.` : `Saved ${result.files} ${result.files === 1 ? 'PDF' : 'PDFs'} in ${result.name}.`;
     if (activeMode === 'compress') text += result.outputBytes < result.inputBytes ? ` ${Math.round((1 - result.outputBytes / result.inputBytes) * 100)}% smaller.` : result.recovered ? ' Saved a repaired copy.' : ' Already optimized. Saved an unchanged copy.';
     if (result.recovered) text += ' PDF data recovered; review the saved copy.';
     message(text, 'success');
   } catch (error) { message(String(error), String(error).startsWith('Cancelled') ? '' : 'error'); }
-  finally { busy = false; jobId = null; cancelAvailable = false; controls(); }
+  finally { busy = false; jobId = null; cancelAvailable = false; renderContinuation(); controls(); }
 }
 function editPages(action) {
   if (busy || !current().selected.size || (action === 'remove' && current().selected.size === current().pages.length)) return;
@@ -680,6 +738,186 @@ function movePreview(offset) {
   previewSession.index = Math.max(0, Math.min(previewSession.count - 1, previewSession.index + offset));
   renderPreview();
 }
+function inspectorPages() {
+  const view = current();
+  const documents = mode === 'compare' ? view.documents.filter((doc) => doc.id === (inspectorPage?.documentId || view.documents[0]?.id)) : view.documents;
+  return mode === 'organize' ? view.pages : documents.filter((doc) => !doc.locked).flatMap((doc) => Array.from({ length: doc.pages }, (_, index) => ({ documentId: doc.id, page: index + 1, rotation: 0 })));
+}
+function setInspector(open) {
+  $('inspector').hidden = !open; $('editor-body').classList.toggle('inspecting', open);
+  $('toggle-inspector').setAttribute('aria-pressed', String(open));
+  $('toggle-inspector').setAttribute('aria-label', open ? 'Hide preview' : 'Show preview');
+  $('toggle-inspector').title = open ? 'Hide preview' : 'Show preview';
+  if (!open) { inspectorSequence++; $('inspector-canvas').previewTicket = null; $('inspector-canvas').replaceChildren(); }
+  else renderInspector();
+}
+function inspectPage(page) { inspectorPage = page; setInspector(true); }
+async function renderInspector() {
+  if ($('inspector').hidden) return;
+  const pages = inspectorPages();
+  if (!pages.length) { setInspector(false); return; }
+  let index = inspectorPage ? pages.findIndex((page) => mode === 'organize' ? pageKey(page) === pageKey(inspectorPage) : page.documentId === inspectorPage.documentId && page.page === inspectorPage.page) : -1;
+  if (index < 0) index = Math.min(inspectorIndex, pages.length - 1);
+  inspectorIndex = index; inspectorPage = { ...pages[index] };
+  const page = pages[index], doc = current().documents.find((item) => item.id === page.documentId) || current().documents[0];
+  const host = $('inspector-canvas'), sequence = ++inspectorSequence;
+  $('inspector-title').textContent = mode === 'organize' ? `Output page ${index + 1}` : `Page ${page.page}`;
+  $('inspector-source').textContent = `${doc.name}, page ${page.page}`;
+  $('inspector-position').textContent = `${index + 1} of ${pages.length}`;
+  $('inspector-previous').disabled = index === 0; $('inspector-next').disabled = index === pages.length - 1;
+  const spec = `${doc.id}:${page.page}:${page.rotation}:${host.clientWidth}:${host.clientHeight}`;
+  if (host.dataset.spec === spec && host.querySelector('canvas')) return;
+  host.dataset.spec = spec;
+  await previews.draw({ host, id: doc.id, bytes: doc.previewBytes, page: page.page, rotation: page.rotation,
+    width: Math.max(1, host.clientWidth - 32), height: Math.max(1, host.clientHeight - 32) });
+  if (sequence !== inspectorSequence) return;
+}
+function renderContinuation() {
+  const view = current(), select = $('continue-tool'), previous = select.value;
+  const choices = view.result ? ['compress', 'organize', 'split', 'merge'].filter((tool) => tool !== mode && (tool !== 'split' || view.result.files === 1)) : [];
+  select.replaceChildren(...choices.map((tool) => { const option = document.createElement('option'); option.value = tool; option.textContent = state[tool].documents.length && tool !== 'split' ? `Add to ${tool === 'organize' ? 'Organize' : tool === 'compress' ? 'Compress' : 'Merge'}` : tools[tool].heading; return option; }));
+  if (choices.includes(previous)) select.value = previous;
+  $('continue-output').hidden = busy || !choices.length;
+}
+async function continueOutput() {
+  if (busy || !current().result) return;
+  const next = $('continue-tool').value, id = current().result.id;
+  busy = true; controls();
+  try {
+    const result = await invoke('import_result_documents', { resultId: id });
+    if (!result.documents.length) throw new Error(result.rejected[0]?.reason || 'The saved output is unavailable.');
+    busy = false; setMode(next); busy = true;
+    await acceptSelection(result.documents); current().importErrors = result.rejected; showImportResult(result);
+  } catch (error) { message(String(error), 'error'); }
+  finally { busy = false; render(); }
+}
+function persistCompression() {
+  preferences.compression = state.compress.compression;
+  preferences.target = state.compress.targetSize;
+  savePreferences(updateStorage, preferences);
+}
+function renderLimitPresets() {
+  const select = $('limit-preset');
+  const empty = document.createElement('option'); empty.value = ''; empty.textContent = 'Upload limits';
+  select.replaceChildren(empty, ...preferences.presets.map((preset, index) => {
+    const option = document.createElement('option'); option.value = String(index); option.textContent = `${preset.name} (${preset.mb} MB)`; return option;
+  }));
+  const match = preferences.presets.findIndex((preset) => preset.mb === Number(state.compress.targetSize));
+  select.value = match < 0 ? '' : String(match); $('delete-limit').hidden = match < 0;
+}
+function clearComparison() {
+  state.compare.comparison = null; $('compare-changes').replaceChildren(); $('compare-summary').textContent = ''; $('compare-warning').hidden = true;
+}
+function renderCompareSlots() {
+  const view = state.compare;
+  $('compare-slots').replaceChildren(...['Original PDF', 'Revised PDF'].map((label, index) => {
+    const doc = view.documents.find((item) => (item.compareRole ?? view.documents.indexOf(item)) === index), slot = document.createElement('section'); slot.className = 'compare-slot';
+    const heading = document.createElement('h3'); heading.textContent = label;
+    const name = document.createElement('p'); name.className = 'file-name'; name.textContent = doc?.name || 'No PDF selected';
+    const actions = document.createElement('div'); actions.className = 'file-actions';
+    const choose = document.createElement('button'); choose.className = 'secondary'; choose.dataset.slot = String(index); choose.textContent = doc ? 'Replace' : 'Choose PDF'; choose.addEventListener('click', () => chooseCompareSlot(index)); actions.append(choose);
+    if (doc) {
+      const button = document.createElement('button'); button.className = 'secondary'; button.textContent = doc.locked ? 'Unlock' : 'Preview';
+      button.addEventListener('click', () => doc.locked ? promptPassword(doc) : openDocumentPreview(doc)); actions.append(button);
+    }
+    slot.append(heading, name, actions); return slot;
+  }));
+}
+async function chooseCompareSlot(index) {
+  if (busy) return; busy = true; controls();
+  try {
+    const result = await invoke('choose_documents', { multiple: false, allowImages: false });
+    if (result.documents.length) {
+      const doc = { ...result.documents[0], compareRole: index };
+      state.compare.documents = [...state.compare.documents.filter((item) => item.compareRole !== index), doc].sort((a,b) => a.compareRole - b.compareRole);
+      clearComparison(); await cleanRegistry();
+    }
+    state.compare.importErrors = result.rejected;
+  } catch (error) { message(String(error), 'error'); }
+  finally { busy = false; render(); promptNextLocked(); }
+}
+async function compareDocuments() {
+  if (busy || !validation()) return;
+  busy = true; cancelAvailable = true; clearComparison(); controls();
+  let cancelled = false, worker, rejectWorker;
+  localCancel = () => { cancelled = true; worker?.terminate(); rejectWorker?.(new Error('Comparison cancelled.')); message('Cancelling comparison...'); };
+  try {
+    const documents = state.compare.documents, texts = [];
+    for (let index = 0; index < 2; index++) {
+      const doc = documents[index];
+      texts.push(await previews.extractText({ id: doc.id, bytes: doc.previewBytes }, (page, total) => message(`Reading ${index === 0 ? 'original' : 'revised'}: page ${page} of ${total}`), () => cancelled));
+    }
+    if (cancelled) throw new Error('Comparison cancelled.');
+    if (texts.some((pages) => !pages.some((page) => page.trim()))) throw new Error('A PDF has no readable page text. Scans need OCR before comparison.');
+    message('Comparing page text...');
+    worker = new Worker(new URL('./compare-worker.js', import.meta.url), { type: 'module' });
+    const result = await new Promise((resolve, reject) => {
+      rejectWorker = reject;
+      worker.onmessage = ({ data }) => data.error ? reject(new Error(data.error)) : resolve(data.result);
+      worker.onerror = () => reject(new Error('These documents could not be compared.'));
+      worker.postMessage({ original: texts[0], revised: texts[1] });
+    });
+    const missing = texts.map((pages) => pages.filter((page) => !page.trim()).length);
+    state.compare.comparison = result;
+    $('compare-summary').textContent = result.changes.length ? `${result.changes.length} changed ${result.changes.length === 1 ? 'passage' : 'passages'}` : 'No wording changes found';
+    const warnings = [];
+    if (missing.some(Boolean)) warnings.push(`${missing[0]} original and ${missing[1]} revised pages have no readable text.`);
+    if (result.coarse) warnings.push('Large differences are grouped together.');
+    $('compare-warning').textContent = warnings.join(' '); $('compare-warning').hidden = !warnings.length;
+    renderComparisonChanges(); message('Comparison ready');
+  } catch (error) { message(error.message, cancelled ? '' : 'error'); }
+  finally { worker?.terminate(); localCancel = null; busy = false; cancelAvailable = false; controls(); }
+}
+function renderComparisonChanges(limit = 30) {
+  const changes = state.compare.comparison?.changes || [], list = $('compare-changes'); list.replaceChildren();
+  for (const [index, change] of changes.slice(0, limit).entries()) {
+    const row = document.createElement('li');
+    const context = document.createElement('p'); context.className = 'change-context'; context.textContent = change.before;
+    const columns = document.createElement('div'); columns.className = 'compare-columns';
+    for (const [side, label, page, tokens] of [[0, 'Original', change.oldPage, change.removed], [1, 'Revised', change.newPage, change.added]]) {
+      const section = document.createElement('section');
+      const jump = document.createElement('button'); jump.className = 'text-button'; jump.textContent = `${label}, page ${page}`;
+      jump.addEventListener('click', () => inspectPage({ documentId: state.compare.documents[side].id, page, rotation: 0 }));
+      const text = document.createElement(side === 0 ? 'del' : 'ins'); const full = tokens.join(' '); text.textContent = full.slice(0, 4000) || (side === 0 ? 'Nothing removed' : 'Nothing added');
+      section.append(jump, text);
+      if (full.length > 4000) { const more = document.createElement('button'); more.className = 'text-button'; more.textContent = 'Show full passage'; more.addEventListener('click', () => { text.textContent = full; more.remove(); }); section.append(more); }
+      columns.append(section);
+    }
+    row.setAttribute('aria-label', `Change ${index + 1}`); row.append(context, columns); list.append(row);
+  }
+  if (changes.length > limit) { const more = document.createElement('button'); more.className = 'secondary'; more.textContent = 'Show more changes'; more.addEventListener('click', () => renderComparisonChanges(limit + 30)); const row = document.createElement('li'); row.append(more); list.append(row); }
+}
+async function checkPages() {
+  const view = current();
+  if (busy || mode !== 'organize') return;
+  if (view.pages.length > 500) { message('Check up to 500 pages at a time. Split a section first.', 'error'); return; }
+  busy = true; cancelAvailable = true; let cancelled = false; localCancel = () => { cancelled = true; };
+  controls(); const findings = [], seen = new Map();
+  try {
+    for (const [index, page] of view.pages.entries()) {
+      if (cancelled) throw new Error('Page check cancelled.');
+      message(`Checking page ${index + 1} of ${view.pages.length}`);
+      const doc = view.documents.find((item) => item.id === page.documentId);
+      const result = await previews.reviewPage({ id: doc.id, bytes: doc.previewBytes, page: page.page, rotation: page.rotation });
+      if (result.blank) findings.push({ key: pageKey(page), label: `Page ${index + 1}: possibly blank` });
+      else if (seen.has(result.hash)) findings.push({ key: pageKey(page), label: `Page ${index + 1}: possible duplicate of page ${seen.get(result.hash)}` });
+      else seen.set(result.hash, index + 1);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    if (cancelled) throw new Error('Page check cancelled.');
+    view.review = findings; renderPageReview(); message(findings.length ? 'Review flagged pages before removing anything.' : 'No possible blank or duplicate pages found.');
+  } catch (error) { message(error.message, cancelled ? '' : 'error'); }
+  finally { busy = false; localCancel = null; cancelAvailable = false; controls(); }
+}
+function renderPageReview() {
+  const host = $('page-review'), review = mode === 'organize' ? current().review : null;
+  host.hidden = !review?.length; host.replaceChildren();
+  if (!review?.length) return;
+  const details = document.createElement('details'), summary = document.createElement('summary'); summary.textContent = `${review.length} pages to review`; details.append(summary);
+  for (const finding of review) { const button = document.createElement('button'); button.className = 'text-button'; button.textContent = finding.label; button.addEventListener('click', () => { const page = current().pages.find((item) => pageKey(item) === finding.key); if (page) inspectPage(page); }); details.append(button); }
+  host.append(details);
+}
+
 async function checkEngine() {
   if (busy) return; busy = true; controls(); $('retry-engine').hidden = true;
   try { await invoke('engine_status'); ready = true; message('Ready'); }
@@ -687,7 +925,7 @@ async function checkEngine() {
   finally { busy = false; render(); }
 }
 function setMode(next) {
-  if (busy || next === mode) return; mode = next; lastSelected = null; const tool = tools[mode];
+  if (busy || next === mode) return; inspectorPage = null; inspectorIndex = 0; mode = next; lastSelected = null; const tool = tools[mode];
   document.title = tool.heading; invoke('set_view_title', { tool: mode }).catch(() => {}); $('heading').textContent = tool.heading; $('save-label').textContent = tool.action;
   $('choose-label').textContent = ['merge', 'organize'].includes(mode) ? 'Choose files' : mode === 'compress' ? 'Choose PDFs' : 'Choose a PDF';
   $('list-label').textContent = ['merge', 'compress', 'organize'].includes(mode) ? 'Documents' : 'Document';
@@ -700,7 +938,7 @@ function setMode(next) {
 for (const button of document.querySelectorAll('.tool')) button.addEventListener('click', () => setMode(button.dataset.mode));
 $('add').addEventListener('click', choose); $('choose').addEventListener('click', choose); $('save').addEventListener('click', save);
 $('clear').addEventListener('click', async () => {
-  if (busy) return; busy = true; invalidateCompression(); current().importErrors = []; current().documents = []; current().pages = []; current().history = []; current().selected.clear(); current().result = null; resetEdits(current()); render();
+  if (busy) return; busy = true; invalidateCompression(); current().importErrors = []; current().documents = []; current().pages = []; current().history = []; current().selected.clear(); current().result = null; current().comparison = null; current().review = null; $('compare-changes').replaceChildren(); $('compare-summary').textContent = ''; resetEdits(current()); render();
   try { await cleanRegistry(); message('Documents cleared.'); }
   catch (error) { message(String(error), 'error'); }
   finally { busy = false; controls(); }
@@ -719,10 +957,11 @@ $('password-form').addEventListener('submit', async (event) => {
     busy = false; controls(); return;
   }
   for (const [tool, view] of Object.entries(state)) {
+    if (tool === 'compare') { view.documents = view.documents.map((doc) => doc.id === info.id ? { ...info, compareRole: doc.compareRole } : doc); clearComparison(); continue; }
     const index = view.documents.findIndex((item) => item.id === info.id);
     if (index === -1) continue;
     const previous = view.documents[index];
-    view.documents[index] = info;
+    view.documents[index] = tool === 'compare' ? { ...info, compareRole: previous.compareRole } : info;
     if (tool === 'organize') {
       view.history.push(view.pages.map((page) => ({ ...page }))); view.future = [];
       const added = pagesFromDocuments([info], () => --duplicateKey);
@@ -781,6 +1020,7 @@ $('release-notes').addEventListener('click', async () => {
 });
 $('retry-engine').addEventListener('click', checkEngine);
 $('cancel').addEventListener('click', async () => {
+  if (localCancel) { localCancel(); return; }
   if (!jobId) return; const cancelledId = jobId; cancelAvailable = false; controls();
   try { await invoke('cancel_job', { jobId: cancelledId }); if (busy && jobId === cancelledId) message('Cancelling local processing...'); }
   catch (error) { if (busy && jobId === cancelledId) message(String(error), 'error'); }
@@ -814,8 +1054,8 @@ $('move-pages-to').addEventListener('click', () => {
 });
 $('rotate').addEventListener('click', () => editPages('rotate')); $('delete-pages').addEventListener('click', () => editPages('remove'));
 $('move-left').addEventListener('click', () => editPages('earlier')); $('move-right').addEventListener('click', () => editPages('later'));
-$('undo').addEventListener('click', () => { const view = current(); if (busy || !view.history.length) return; view.future.push(view.pages.map((page) => ({ ...page }))); view.pages = view.history.pop(); view.selected.clear(); lastSelected = null; view.result = null; render(); message('Page edit undone.'); });
-$('redo').addEventListener('click', () => { const view = current(); if (busy || !view.future.length) return; view.history.push(view.pages.map((page) => ({ ...page }))); view.pages = view.future.pop(); view.selected.clear(); lastSelected = null; view.result = null; render(); message('Page edit redone.'); });
+$('undo').addEventListener('click', () => { const view = current(); if (busy || !view.history.length) return; view.review = null; view.future.push(view.pages.map((page) => ({ ...page }))); view.pages = view.history.pop(); view.selected.clear(); lastSelected = null; view.result = null; render(); message('Page edit undone.'); });
+$('redo').addEventListener('click', () => { const view = current(); if (busy || !view.future.length) return; view.review = null; view.history.push(view.pages.map((page) => ({ ...page }))); view.pages = view.future.pop(); view.selected.clear(); lastSelected = null; view.result = null; render(); message('Page edit redone.'); });
 $('previous-pages').addEventListener('click', () => { if (busy || !current().pageWindow) return; current().pageWindow -= 1; render(); });
 $('next-pages').addEventListener('click', () => { if (busy || (current().pageWindow + 1) * PAGE_WINDOW >= current().pages.length) return; current().pageWindow += 1; render(); });
 $('jump-page').addEventListener('change', () => {
@@ -826,7 +1066,7 @@ $('jump-page').addEventListener('change', () => {
   }
   $('jump-page').value = '';
 });
-$('thumbnail-size').addEventListener('input', () => { $('page-grid').style.setProperty('--thumb', `${$('thumbnail-size').value}px`); });
+$('thumbnail-size').addEventListener('input', () => { $('page-grid').style.setProperty('--thumb', `${$('thumbnail-size').value}px`); preferences.thumbnail = Number($('thumbnail-size').value); savePreferences(updateStorage, preferences); });
 $('preview-previous').addEventListener('click', () => movePreview(-1));
 $('preview-next').addEventListener('click', () => movePreview(1));
 $('preview-page').addEventListener('change', () => {
@@ -856,7 +1096,51 @@ document.addEventListener('keydown', (event) => {
   if (event.key.toLowerCase() === 's') { event.preventDefault(); save(); }
   if (event.key.toLowerCase() === 'z' && mode === 'organize' && !['INPUT', 'TEXTAREA'].includes(event.target.tagName)) { event.preventDefault(); (event.shiftKey ? $('redo') : $('undo')).click(); }
 });
-$('page-grid').style.setProperty('--thumb', `${$('thumbnail-size').value}px`);
+$('toggle-inspector').addEventListener('click', () => setInspector($('inspector').hidden));
+$('close-inspector').addEventListener('click', () => setInspector(false));
+for (const [id, offset] of [['inspector-previous', -1], ['inspector-next', 1]]) $(id).addEventListener('click', () => {
+  const pages = inspectorPages(); inspectorIndex = Math.max(0, Math.min(pages.length - 1, inspectorIndex + offset)); inspectorPage = pages[inspectorIndex]; renderInspector();
+});
+$('expand-inspector').addEventListener('click', () => { if (inspectorPage) { const doc = current().documents.find((item) => item.id === inspectorPage.documentId) || current().documents[0]; openDocumentPreview(doc, inspectorPage.page); if (mode === 'organize' && previewSession) { previewSession.index = inspectorIndex; renderPreview(); } } });
+let inspectorResizeTimer;
+new ResizeObserver(() => { clearTimeout(inspectorResizeTimer); inspectorResizeTimer = setTimeout(renderInspector, 100); }).observe($('inspector-canvas'));
+$('continue-button').addEventListener('click', continueOutput);
+$('merge-bookmarks').addEventListener('change', () => { current().mergeBookmarks = $('merge-bookmarks').checked; current().result = null; controls(); });
+$('check-pages').addEventListener('click', checkPages);
+$('swap-documents').addEventListener('click', () => { if (busy) return; for (const doc of state.compare.documents) doc.compareRole = 1 - doc.compareRole; state.compare.documents.sort((a,b) => a.compareRole - b.compareRole); clearComparison(); render(); });
+$('limit-preset').addEventListener('change', () => {
+  const preset = preferences.presets[Number($('limit-preset').value)];
+  if ($('limit-preset').value === '' || !preset) return;
+  invalidateCompression(); state.compress.targetSize = String(preset.mb); state.compress.result = null; $('target-size').value = state.compress.targetSize;
+  persistCompression(); renderLimitPresets(); render();
+});
+$('save-limit').addEventListener('click', () => { if (busy || !targetBytes(state.compress)) return; $('limit-name').value = ''; $('limit-dialog').showModal(); $('limit-name').focus(); });
+$('cancel-limit').addEventListener('click', () => $('limit-dialog').close());
+$('limit-form').addEventListener('submit', (event) => {
+  event.preventDefault(); const name = $('limit-name').value.trim();
+  if (!name || !targetBytes(state.compress)) return;
+  const existing = preferences.presets.findIndex((preset) => preset.name.toLowerCase() === name.toLowerCase());
+  const preset = { name, mb: Number(state.compress.targetSize) };
+  if (existing >= 0) preferences.presets[existing] = preset; else if (preferences.presets.length < 12) preferences.presets.push(preset);
+  savePreferences(updateStorage, preferences); renderLimitPresets(); $('limit-dialog').close(); controls();
+});
+$('delete-limit').addEventListener('click', () => { if (busy || $('limit-preset').value === '') return; preferences.presets.splice(Number($('limit-preset').value), 1); savePreferences(updateStorage, preferences); renderLimitPresets(); controls(); });
+for (const input of document.querySelectorAll('input[name="compression"]')) input.addEventListener('change', persistCompression);
+$('target-size').addEventListener('input', () => { persistCompression(); renderLimitPresets(); });
+// Keep corresponding locations aligned while reviewing image compression.
+let syncingPreview = false;
+for (const [sourceId, targetId] of [['large-preview', 'compressed-preview'], ['compressed-preview', 'large-preview']]) $(sourceId).addEventListener('scroll', () => {
+  if (!previewSession?.compare || syncingPreview) return;
+  syncingPreview = true; const source = $(sourceId), target = $(targetId);
+  target.scrollTop = source.scrollTop / Math.max(1, source.scrollHeight - source.clientHeight) * (target.scrollHeight - target.clientHeight);
+  target.scrollLeft = source.scrollLeft / Math.max(1, source.scrollWidth - source.clientWidth) * (target.scrollWidth - target.clientWidth);
+  requestAnimationFrame(() => { syncingPreview = false; });
+});
+
+$('thumbnail-size').value = String(preferences.thumbnail); $('target-size').value = state.compress.targetSize;
+for (const input of document.querySelectorAll('input[name="compression"]')) input.checked = input.value === state.compress.compression;
+$('page-grid').style.setProperty('--thumb', `${preferences.thumbnail}px`);
+renderLimitPresets();
 const installedVersion = getVersion().then((version) => { $('app-version').textContent = `Version ${version}`; $('app-version').hidden = false; return version; }).catch(() => null);
 render();
 Promise.all([checkEngine(), installedVersion]).then(([, version]) => { if (version) automaticUpdateCheck(version); });

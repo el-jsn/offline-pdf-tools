@@ -55,7 +55,7 @@ struct Store {
     dropped_paths: Mutex<HashSet<PathBuf>>,
     operation: Mutex<()>,
     job: Mutex<Option<(String, Arc<AtomicBool>)>>,
-    results: Mutex<HashMap<String, PathBuf>>,
+    results: Mutex<HashMap<String, SavedOutput>>,
     compression_preview: Mutex<Option<Arc<CompressionPreview>>>,
     pending_update: Mutex<Option<(String, tauri_plugin_updater::Update)>>,
 }
@@ -76,6 +76,8 @@ struct CompressionPreview {
     // Keep the private directory alive until the cached outputs are released.
     _workspace: tempfile::TempDir,
 }
+#[derive(Clone)]
+struct SavedOutput { path: PathBuf, files: Vec<PathBuf> }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DocumentInfo {
@@ -161,6 +163,7 @@ struct Request {
     #[serde(default)] output_names: Vec<String>,
     #[serde(default)] flatten_forms: bool,
     #[serde(default)] acknowledge_changes: bool,
+    #[serde(default)] merge_bookmarks: bool,
 }
 struct JobLease {
     store: Arc<Store>,
@@ -660,6 +663,17 @@ fn optimize_images(
     Ok(())
 }
 
+fn navigation_documents(documents: &[Selected], filename_bookmarks: bool) -> Vec<Selected> {
+    let mut navigation = documents.to_vec();
+    if filename_bookmarks {
+        for document in &mut navigation {
+            let title = document.path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            document.features.bookmarks = vec![Bookmark { title, page: Some(1), children: document.features.bookmarks.clone() }];
+        }
+    }
+    navigation
+}
+
 fn preserve_navigation(engine: &Path, output: &tempfile::NamedTempFile, documents: &[Selected], layout: &[(usize,u32,u16)], workspace: &Path, cancel: &AtomicBool) -> Result<(), String> {
     let json = inspect_json(engine, output.path(), Some(cancel))?;
     let original = json.pointer("/qpdf/1").and_then(|v| v.as_object()).ok_or("Cannot check document navigation.")?;
@@ -721,6 +735,7 @@ fn preserve_navigation(engine: &Path, output: &tempfile::NamedTempFile, document
 fn record_result(
     store: &Store,
     path: PathBuf,
+    output_paths: Vec<PathBuf>,
     files: usize,
     input_bytes: u64,
     output_bytes: u64,
@@ -743,7 +758,7 @@ fn record_result(
         file_bytes: Vec::new(),
         recovered,
     };
-    results.insert(id, path);
+    results.insert(id, SavedOutput { path, files: output_paths });
     Ok(saved)
 }
 
@@ -1173,7 +1188,8 @@ async fn process_documents(
                 let layout: Vec<(usize,u32,u16)> = if request.operation == Operation::Split { plan[index].iter().map(|p| (0,*p,0)).collect() }
                     else if request.pages.is_empty() { documents.iter().enumerate().flat_map(|(i,doc)| (1..=doc.pages).map(move |p| (i,p,0))).collect() }
                     else { request.pages.iter().map(|p| (request.ids.iter().position(|id| id == &p.document_id).unwrap_or(0),p.page,p.rotation)).collect() };
-                preserve_navigation(&engine, &output, &documents, &layout, workspace.path(), &cancel)?;
+                let navigation = navigation_documents(&documents, request.operation == Operation::Merge && request.merge_bookmarks);
+                preserve_navigation(&engine, &output, &navigation, &layout, workspace.path(), &cancel)?;
                 size = validate_output(&engine, output.path(), expected, &cancel)?;
             }
             if request.operation == Operation::Compress && request.compression != Compression::Lossless {
@@ -1214,6 +1230,7 @@ async fn process_documents(
         if multiple_outputs {
             let prefix = if request.operation == Operation::Split { "Split PDFs-" } else { "Compressed PDFs-" };
             let folder = tempfile::Builder::new().prefix(prefix).tempdir_in(parent).map_err(|_| "Cannot create an output folder.")?;
+            let mut output_paths = Vec::new();
             for (index, output) in outputs.into_iter().enumerate() {
                 let filename = if request.operation == Operation::Compress {
                     let stem: String = documents[index].path.file_stem().unwrap_or_default().to_string_lossy().chars().take(50).collect();
@@ -1223,17 +1240,30 @@ async fn process_documents(
                 let staged = tempfile::Builder::new().suffix(".pdf").tempfile_in(folder.path()).map_err(|_| "Cannot save PDF.")?;
                 copy_into(output.path(), staged.as_file(), None)?;
                 staged.persist_noclobber(&path).map_err(|_| "Cannot save PDFs. No output folder was retained.")?;
+                output_paths.push(path);
             }
             let path = folder.keep();
-            Ok(Some(record_result(&store, path, jobs, input_bytes, output_bytes, recovered)?))
+            Ok(Some(record_result(&store, path, output_paths, jobs, input_bytes, output_bytes, recovered)?))
         } else {
             let output = outputs.pop().ok_or("No PDF was produced.")?;
             let staged = tempfile::Builder::new().prefix(".pdf-tools-save-").tempfile_in(parent).map_err(|_| "Cannot save PDF.")?;
             copy_into(output.path(), staged.as_file(), None)?;
             staged.persist_noclobber(&destination).map_err(|_| "Cannot save the PDF. Choose a new filename and a writable folder.")?;
-            Ok(Some(record_result(&store, destination, 1, input_bytes, output_bytes, recovered)?))
+            Ok(Some(record_result(&store, destination.clone(), vec![destination], 1, input_bytes, output_bytes, recovered)?))
         }
     }).await.map_err(|_| "PDF processing failed.")?
+}
+#[tauri::command]
+async fn import_result_documents(app: tauri::AppHandle, state: tauri::State<'_, Arc<Store>>, result_id: String) -> Result<ImportResult, String> {
+    let store = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _busy = store.operation.try_lock().map_err(|_| "Another operation is in progress.")?;
+        let paths = store.results.lock().map_err(|_| "Saved output is unavailable.")?
+            .get(&result_id).map(|result| result.files.clone()).ok_or("Saved output is no longer available in this session.")?;
+        if paths.len() > MAX_DOCUMENTS { return Err("Add at most 100 output PDFs at a time using Add PDFs.".into()); }
+        let engine = engine(&app)?;
+        select_paths(&store, &engine, paths, false)
+    }).await.map_err(|_| "Cannot open the saved output.")?
 }
 #[tauri::command]
 async fn reveal_result(
@@ -1245,7 +1275,7 @@ async fn reveal_result(
         .lock()
         .map_err(|_| "Saved output is unavailable.")?
         .get(&result_id)
-        .cloned()
+        .map(|result| result.path.clone())
         .ok_or("Saved output is no longer available in this session.")?;
     tauri::async_runtime::spawn_blocking(move || {
         if !path.exists() {
@@ -1321,6 +1351,7 @@ fn set_view_title(window: tauri::Window, tool: String) -> Result<(), String> {
         "compress" => "Compress PDF",
         "split" => "Split PDF",
         "organize" => "Organize pages",
+        "compare" => "Compare PDFs",
         _ => return Err("Unknown PDF tool.".into()),
     };
     window
@@ -1487,6 +1518,7 @@ fn main() {
             process_documents,
             discard_compression_preview,
             reveal_result,
+            import_result_documents,
             open_release_notes,
             set_view_title,
             check_app_update,
@@ -1617,6 +1649,33 @@ mod stream_repair_tests {
         checked(Command::new(&engine).args(["--empty","--pages"]).arg(&source).args(["2,1","--"]).arg(output.path()),Some(&cancel)).unwrap();
         preserve_navigation(&engine,&output,&[document],&[(0,2,0),(0,1,0)],directory.path(),&cancel).unwrap();
         let result=inspect_features(&engine,output.path(),Some(&cancel)).unwrap();assert_eq!(result.bookmarks.len(),2);assert_eq!(result.bookmarks[0].page,Some(2));assert_eq!(result.bookmarks[1].page,Some(1));
+    }
+    #[test]
+    fn filename_bookmarks_preserve_children_and_map_document_starts() {
+        let directory = tempfile::tempdir().unwrap(); let engine = engine_path(); let cancel = AtomicBool::new(false);
+        let first = directory.path().join("Income.pdf"); let second = directory.path().join("Statements.pdf");
+        fixture(VALID, &first); fixture(VALID, &second);
+        let mut documents = vec![inspect(&engine,&first,None).unwrap(),inspect(&engine,&second,None).unwrap()];
+        documents[0].features.bookmarks = vec![Bookmark {title:"Existing section".into(),page:Some(1),children:vec![]}];
+        let before = digest(&first,None).unwrap();
+        let output = tempfile::Builder::new().suffix(".pdf").tempfile_in(directory.path()).unwrap();
+        checked(Command::new(&engine).args(["--empty","--pages"]).arg(&first).arg("1").arg(&second).args(["1","--"]).arg(output.path()),None).unwrap();
+        let navigation = navigation_documents(&documents,true);
+        preserve_navigation(&engine,&output,&navigation,&[(0,1,0),(1,1,0)],directory.path(),&cancel).unwrap();
+        let result = inspect_features(&engine,output.path(),None).unwrap();
+        assert_eq!(result.bookmarks.len(),2); assert_eq!(result.bookmarks[0].title,"Income"); assert_eq!(result.bookmarks[1].title,"Statements");
+        assert_eq!(result.bookmarks[1].page,Some(2)); assert_eq!(result.bookmarks[0].children[0].title,"Existing section");
+        assert_eq!(documents[0].features.bookmarks[0].title,"Existing section"); assert_eq!(digest(&first,None).unwrap(),before);
+    }
+    #[test]
+    fn saved_output_continuation_records_only_published_paths() {
+        let directory = tempfile::tempdir().unwrap(); let store = Store::new().unwrap();
+        let first = directory.path().join("001-first.pdf"); let unrelated = directory.path().join("unrelated.pdf");
+        fixture(VALID,&first); fixture(VALID,&unrelated);
+        let saved = record_result(&store,directory.path().to_owned(),vec![first.clone()],1,100,100,false).unwrap();
+        let files = store.results.lock().unwrap().get(&saved.id).unwrap().files.clone();
+        let result = select_paths(&store,&engine_path(),files,false).unwrap();
+        assert_eq!(result.documents.len(),1); assert_eq!(result.documents[0].name,"001-first.pdf");
     }
     #[test]
     fn another_instance_does_not_delete_live_working_files() {

@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getDocument, GlobalWorkerOptions, PDFDataRangeTransport } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import workerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
+import { pageText } from './pdf-text.js';
 GlobalWorkerOptions.workerSrc = workerUrl;
 
 const CHUNK = 1024 * 1024;
@@ -112,5 +113,50 @@ export class Previews {
   async releaseUnused(keys) {
     const keep = new Set(keys);
     for (const key of [...this.cache.keys()]) if (!keep.has(key)) await this.forget(key);
+  }
+  async withDocument(spec, action) {
+    const key = this.key(spec);
+    this.activeIds.set(key, (this.activeIds.get(key) || 0) + 1);
+    try { return await action(await this.pdf(spec)); }
+    finally {
+      const count = this.activeIds.get(key) - 1;
+      if (count) this.activeIds.set(key, count); else this.activeIds.delete(key);
+    }
+  }
+  async extractText(spec, progress, cancelled) {
+    return this.withDocument(spec, async (pdf) => {
+      if (pdf.numPages > 500) throw new Error('Compare supports up to 500 pages per PDF. Split a section first.');
+      const pages = []; let length = 0;
+      for (let index = 1; index <= pdf.numPages; index++) {
+        if (cancelled()) throw new Error('Comparison cancelled.');
+        progress(index, pdf.numPages);
+        const page = await pdf.getPage(index);
+        const content = await page.getTextContent();
+        const text = pageText(content.items);
+        length += text.length;
+        if (length > 1000000) throw new Error('This PDF has too much text to compare at once. Split a section first.');
+        pages.push(text);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      return pages;
+    });
+  }
+  async reviewPage(spec) {
+    return this.withDocument(spec, async (pdf) => {
+      const page = await pdf.getPage(spec.page);
+      const initial = page.getViewport({ scale: 1, rotation: (page.rotate + spec.rotation) % 360 });
+      const viewport = page.getViewport({ scale: Math.min(420 / initial.width, 600 / initial.height), rotation: initial.rotation });
+      const canvas = document.createElement('canvas'); canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height);
+      const context = canvas.getContext('2d', { willReadFrequently: true });
+      await page.render({ canvas, canvasContext: context, viewport, annotationMode: 1 }).promise;
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      const content = await page.getTextContent();
+      const text = pageText(content.items);
+      let marks = 0;
+      for (let offset = 0; offset < pixels.length; offset += 4) if (Math.min(pixels[offset], pixels[offset + 1], pixels[offset + 2]) < 245) marks++;
+      const pixelHash = new Uint8Array(await crypto.subtle.digest('SHA-256', pixels));
+      const hash = [...pixelHash].map((byte) => byte.toString(16).padStart(2, '0')).join('') + `:${canvas.width}:${canvas.height}:${text}`;
+      return { blank: !text.trim() && marks / (pixels.length / 4) < 0.0002, hash };
+    });
   }
 }
