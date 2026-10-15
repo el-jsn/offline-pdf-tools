@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getDocument, GlobalWorkerOptions, PDFDataRangeTransport } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import workerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 import { pageText } from './pdf-text.js';
+import { comparisonFields } from './compare-fields.js';
 GlobalWorkerOptions.workerSrc = workerUrl;
 
 const CHUNK = 1024 * 1024;
@@ -123,22 +124,28 @@ export class Previews {
       if (count) this.activeIds.set(key, count); else this.activeIds.delete(key);
     }
   }
-  async extractText(spec, progress, cancelled) {
+  async extractComparison(spec, progress, cancelled) {
     return this.withDocument(spec, async (pdf) => {
       if (pdf.numPages > 500) throw new Error('Compare supports up to 500 pages per PDF. Split a section first.');
-      const pages = []; let length = 0;
+      const pages = [], fields = []; let length = 0, unsupportedFields = false;
       for (let index = 1; index <= pdf.numPages; index++) {
         if (cancelled()) throw new Error('Comparison cancelled.');
         progress(index, pdf.numPages);
         const page = await pdf.getPage(index);
         const content = await page.getTextContent();
         const text = pageText(content.items);
-        length += text.length;
+        const annotations = await page.getAnnotations();
+        const pageFields = comparisonFields(annotations, index);
+        fields.push(...pageFields);
+        unsupportedFields ||= annotations.some((item) => item.subtype === 'Widget' &&
+          !['Tx', 'Ch', 'Btn'].includes(item.fieldType));
+        length += text.length + pageFields.reduce((total, field) => total + field.name.length + field.value.length, 0);
         if (length > 1000000) throw new Error('This PDF has too much text to compare at once. Split a section first.');
         pages.push(text);
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
-      return pages;
+      const { info } = await pdf.getMetadata();
+      return { pages, fields, unsupportedFields, hasXfa: Boolean(info.IsXFAPresent) };
     });
   }
   async reviewPage(spec) {

@@ -869,11 +869,11 @@ async function compareDocuments() {
     const documents = state.compare.documents, texts = [];
     for (let index = 0; index < 2; index++) {
       const doc = documents[index];
-      texts.push(await previews.extractText({ id: doc.id, bytes: doc.previewBytes }, (page, total) => message(`Reading ${index === 0 ? 'original' : 'revised'}: page ${page} of ${total}`), () => cancelled));
+      texts.push(await previews.extractComparison({ id: doc.id, bytes: doc.previewBytes }, (page, total) => message(`Reading ${index === 0 ? 'original' : 'revised'}: page ${page} of ${total}`), () => cancelled));
     }
     if (cancelled) throw new Error('Comparison cancelled.');
-    if (texts.some((pages) => !pages.some((page) => page.trim()))) throw new Error('A PDF has no readable page text. Scans need OCR before comparison.');
-    message('Comparing page text...');
+    if (texts.some((doc) => !doc.pages.some((page) => page.trim()) && !doc.fields.length)) throw new Error('A PDF has no readable text or supported form fields. Scans need OCR before comparison.');
+    message('Comparing text and form fields...');
     worker = new Worker(new URL('./compare-worker.js', import.meta.url), { type: 'module' });
     const result = await new Promise((resolve, reject) => {
       rejectWorker = reject;
@@ -881,11 +881,17 @@ async function compareDocuments() {
       worker.onerror = () => reject(new Error('These documents could not be compared.'));
       worker.postMessage({ original: texts[0], revised: texts[1] });
     });
-    const missing = texts.map((pages) => pages.filter((page) => !page.trim()).length);
+    const missing = texts.map((doc) => doc.pages.filter((page) => !page.trim()).length);
     state.compare.comparison = result;
-    $('compare-summary').textContent = result.changes.length ? `${result.changes.length} changed ${result.changes.length === 1 ? 'passage' : 'passages'}` : 'No wording changes found';
+    const fieldCount = result.changes.filter((change) => change.kind === 'field').length;
+    const passageCount = result.changes.length - fieldCount;
+    $('compare-summary').textContent = result.changes.length ? [
+      passageCount && `${passageCount} changed ${passageCount === 1 ? 'passage' : 'passages'}`,
+      fieldCount && `${fieldCount} changed form ${fieldCount === 1 ? 'field' : 'fields'}`,
+    ].filter(Boolean).join(', ') : 'No text or form-field changes found';
     const warnings = [];
     if (missing.some(Boolean)) warnings.push(`${missing[0]} original and ${missing[1]} revised pages have no readable text.`);
+    if (texts.some((doc) => doc.unsupportedFields || doc.hasXfa)) warnings.push('Signature fields and XFA forms are not compared.');
     if (result.coarse) warnings.push('Large differences are grouped together.');
     $('compare-warning').textContent = warnings.join(' '); $('compare-warning').hidden = !warnings.length;
     renderComparisonChanges(); message('Comparison ready');
@@ -901,7 +907,8 @@ function renderComparisonChanges(limit = 30) {
     for (const [side, label, page, tokens] of [[0, 'Original', change.oldPage, change.removed], [1, 'Revised', change.newPage, change.added]]) {
       const section = document.createElement('section');
       const jump = document.createElement('button'); jump.className = 'text-button'; jump.textContent = `${label}, page ${page}`;
-      jump.addEventListener('click', () => inspectPage({ documentId: state.compare.documents[side].id, page, rotation: 0 }));
+      if (page === null) { jump.textContent = `${label}: field not present`; jump.disabled = true; }
+      else jump.addEventListener('click', () => inspectPage({ documentId: state.compare.documents[side].id, page, rotation: 0 }));
       const text = document.createElement(side === 0 ? 'del' : 'ins'); const full = tokens.join(' '); text.textContent = full.slice(0, 4000) || (side === 0 ? 'Nothing removed' : 'Nothing added');
       section.append(jump, text);
       if (full.length > 4000) { const more = document.createElement('button'); more.className = 'text-button'; more.textContent = 'Show full passage'; more.addEventListener('click', () => { text.textContent = full; more.remove(); }); section.append(more); }
