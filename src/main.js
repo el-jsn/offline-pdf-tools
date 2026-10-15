@@ -127,6 +127,7 @@ function controls() {
   $('selected-page-actions').hidden = !view.selected.size;
   $('merge-options-summary').textContent = view.mergeBookmarks ? 'Options: bookmarks on' : 'Options';
   for (const button of $('page-review').querySelectorAll('button')) button.disabled = busy; $('choose').disabled = busy || !ready;
+  $('compression-progress').hidden = mode !== 'compress' || !busy || !cancelAvailable;
   $('busy-indicator').hidden = !busy; $('loaded').setAttribute('aria-busy', String(busy));
   $('cancel').hidden = !busy || !cancelAvailable; $('reveal').hidden = busy || !view.result;
   document.querySelectorAll('.tool, #compression-options input, #split-options input, #split-options select, #split-options button').forEach((control) => { control.disabled = busy; });
@@ -145,6 +146,7 @@ function controls() {
   $('jump-page').disabled = busy || !view.pages.length; $('thumbnail-size').disabled = busy;
   $('compare-output').disabled = busy || !state.compress.compressionPreview || state.compress.documents.length !== 1;
   $('target-size').disabled = busy || view.compression === 'lossless';
+  $('target-hint').hidden = mode !== 'compress' || view.compression === 'lossless' || !targetBytes(view);
   if (view.targetSize.trim() && targetBytes(view) === null) $('target-size').setAttribute('aria-invalid', 'true'); else $('target-size').removeAttribute('aria-invalid');
   $('password-unlock').disabled = busy; $('password-skip').disabled = busy; $('pdf-password').disabled = busy;
   $('flatten-forms').disabled = busy; $('acknowledge-changes').disabled = busy;
@@ -590,9 +592,13 @@ function compressionSummary() {
     return;
   }
   const saved = measured.inputBytes - measured.outputBytes;
-  host.textContent = saved > 0 ? `Expected output: ${bytes(measured.outputBytes)}, saves ${bytes(saved)}` : `Expected output: ${bytes(measured.outputBytes)}, already optimized`;
+  const percent = measured.inputBytes > 0 ? Math.round(saved / measured.inputBytes * 100) : 0;
+  host.textContent = saved > 0 ? `Expected output: ${bytes(measured.outputBytes)}, saves ${bytes(saved)} (${percent}%)` : `Expected output: ${bytes(measured.outputBytes)}, already optimized`;
   const limit = targetBytes(view);
-  if (limit && measured.fileBytes.some((size) => size > limit)) host.textContent += ' — Over limit';
+  if (limit) {
+    const over = measured.fileBytes.filter((size) => size > limit).length;
+    host.textContent += over ? `; ${measured.files > 1 ? `${over} PDFs exceed target` : 'exceeds target'}` : '; within target';
+  }
   host.classList.toggle('invalid', Boolean(limit && measured.fileBytes.some((size) => size > limit)));
   host.title = `${measured.outputBytes.toLocaleString()} bytes${measured.files > 1 ? ' total' : ''}`;
 }
@@ -613,9 +619,14 @@ async function measureCompression(key) {
   const onProgress = new Channel();
   onProgress.onmessage = (progress) => { message(progress.message); cancelAvailable = progress.cancellable; controls(); };
   try {
-    view.compressionPreview = await invoke('process_documents', {
+    const preview = await invoke('process_documents', {
       request: { jobId, operation: 'compress', ids: view.documents.map((doc) => doc.id), compression: view.compression, targetBytes: targetBytes(view), acknowledgeChanges: view.acknowledgeChanges, measureOnly: true }, onProgress,
     });
+    view.compressionPreview = preview;
+    compressionSummary();
+    if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      $('compression-size').animate([{ opacity: 0, transform: 'translateY(3px)' }, { opacity: 1, transform: 'translateY(0)' }], { duration: 220, easing: 'ease-out' });
+    }
     message(view.compressionPreview.recovered ? 'Ready to save. PDF data recovered; review the saved copy.' : 'Ready to save');
   } catch (error) {
     view.measurementFailed = true;

@@ -46,6 +46,8 @@ groups and custom ranges are alternatives. A new output folder prevents collisio
 
 Lossless compression is the default. The other presets explicitly select JPEG
 quality 80 or 55, which can alter image detail. No preset guarantees a target size.
+A size target first runs the selected preset, then tries additional settings only
+if needed, retaining the smallest valid candidate. Targets are best effort.
 If optimization increases the size, an unchanged source copy is saved instead.
 
 Progress describes actual stages. It uses an activity indicator during engine work

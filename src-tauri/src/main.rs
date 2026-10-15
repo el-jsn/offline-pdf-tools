@@ -1155,6 +1155,10 @@ async fn process_documents(
                 if let Some(target) = request.target_bytes {
                     let baseline = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot prepare compression.")?;
                     copy_into(output.path(), baseline.as_file(), Some(&cancel))?;
+                    // Always try the selected preset first, just as we do without a target.
+                    // Keep the pre-compression baseline for independent stronger attempts.
+                    compression::optimize(&engine, &output, workspace.path(), request.compression, expected, None, &cancel)?;
+                    size = validate_output(&engine, output.path(), expected, &cancel)?;
                     for &tuning in compression::tunings(request.compression) {
                         if size <= target { break; }
                         let attempt = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot prepare compression.")?;

@@ -1117,3 +1117,37 @@ input[aria-invalid=true] { border-color:var(--error); }
 #selected-page-actions:not([hidden])+#check-pages { border-top:1px solid var(--border); border-radius:0; padding-top:12px; }
 
 .page-navigation>div { margin-left:auto; }
+
+
+/* Indeterminate activity follows real compression work, without implying a percentage. */
+.status-bar { position:relative; }
+.compression-progress {
+  position:absolute;
+  top:-1px;
+  left:0;
+  right:0;
+  height:3px;
+  overflow:hidden;
+  background:var(--spinner-track);
+  pointer-events:none;
+}
+.compression-progress > span {
+  display:block;
+  width:30%;
+  height:100%;
+  border-radius:999px;
+  background:var(--accent);
+  animation:compression-activity 1.6s ease-in-out infinite;
+}
+@keyframes compression-activity {
+  from { transform:translateX(-100%); }
+  to { transform:translateX(334%); }
+}
+@media (prefers-reduced-motion:reduce) {
+  .compression-progress > span {
+    animation:none;
+    transform:none;
+    width:100%;
+    opacity:.55;
+  }
+}
