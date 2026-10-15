@@ -36,8 +36,21 @@ struct Optimizer<'a> {
     quality: u8,
     dpi: u32,
     examined: usize,
+    uses: HashMap<[u8; 32], usize>,
 }
 impl Optimizer<'_> {
+    fn count_uses(&mut self, object: PdfPageObject<'_>, depth: usize) -> Result<(), String> {
+        if depth > 16 || self.examined > 200000 { return Err("This PDF is too complex for image compression.".into()); }
+        self.examined += 1;
+        if let Some(form) = object.as_x_object_form_object() {
+            for child in form.iter() { self.count_uses(child, depth + 1)?; }
+        } else if let Some(image) = object.as_image_object() {
+            if let Ok(raw) = image.get_raw_image_data() {
+                if raw.len() <= 32 * 1024 * 1024 { let hash: [u8; 32] = Sha256::digest(&raw).into(); *self.uses.entry(hash).or_default() += 1; }
+            }
+        }
+        Ok(())
+    }
     fn visit(&mut self, object: PdfPageObject<'_>, depth: usize) -> Result<(), String> {
         if depth > 16 || self.examined > 200000 {
             return Err("This PDF is too complex for image compression.".into());
@@ -97,7 +110,7 @@ impl Optimizer<'_> {
             }
             // Nested form transforms and reused images may have different physical sizes.
             // Preserve those images rather than guessing the lowest safe resolution.
-            if depth > 0 || candidates.len() != 1 { return Ok(()); }
+            if depth > 0 || candidates.len() != 1 || self.uses.get(&hash).copied().unwrap_or(0) != 1 { return Ok(()); }
             let Ok(bounds) = object.bounds() else { return Ok(()); };
             let display_width = bounds.width().value.abs() as f64;
             let display_height = bounds.height().value.abs() as f64;
@@ -227,7 +240,10 @@ fn process(config: Config) -> Result<usize, String> {
         quality: config.quality.unwrap_or(quality),
         dpi: config.dpi.unwrap_or(dpi),
         examined: 0,
+        uses: HashMap::new(),
     };
+    for page in document.pages().iter() { for object in page.objects().iter() { optimizer.count_uses(object, 0)?; } }
+    optimizer.examined = 0;
     for page in document.pages().iter() {
         for object in page.objects().iter() {
             optimizer.visit(object, 0)?;

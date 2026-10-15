@@ -58,6 +58,11 @@ struct Store {
     compression_preview: Mutex<Option<Arc<CompressionPreview>>>,
     pending_update: Mutex<Option<(String, tauri_plugin_updater::Update)>>,
 }
+impl Store {
+    fn new() -> Result<Arc<Self>, String> {
+        Ok(Arc::new(Self { workspace: workspace::Workspace::new()?, documents: Mutex::default(), dropped_paths: Mutex::default(), operation: Mutex::default(), job: Mutex::default(), results: Mutex::default(), compression_preview: Mutex::default(), pending_update: Mutex::default() }))
+    }
+}
 struct CompressionPreview {
     id: String,
     ids: Vec<String>,
@@ -369,7 +374,7 @@ fn inspect_features(engine: &Path, path: &Path, cancel: Option<&AtomicBool>) -> 
     let json = inspect_json(engine, path, cancel)?;
     let objects = json.pointer("/qpdf/1").and_then(|v| v.as_object()).ok_or("Cannot inspect document structure.")?;
     let root = objects.get("trailer").and_then(|v| v.pointer("/value/~1Root")).and_then(|v| v.as_str()).ok_or("Cannot inspect document catalog.")?;
-    let catalog = &objects[&format!("obj:{root}")]["value"];
+    let catalog = objects.get(&format!("obj:{root}")).and_then(|v|v.get("value")).ok_or("Cannot inspect document catalog.")?;
     let fields = json.pointer("/acroform/fields").and_then(|v| v.as_array()).ok_or("Cannot inspect forms.")?;
     let signatures = fields.iter().any(|field| field["fieldtype"] == "/Sig") || catalog.get("/Perms").is_some();
     Ok(Features {
@@ -512,6 +517,30 @@ fn range_argument(pages: &[u32]) -> String {
     }
     chunks.join(",")
 }
+// Only private snapshots reach this function. Repair compressed streams once,
+// then require a clean check and the original page count before using the copy.
+fn repair_snapshot_if_needed(
+    engine: &Path, snapshot: &Path, expected: usize, cancel: &AtomicBool,
+) -> Result<bool, String> {
+    let (code, _) = run(Command::new(engine).arg("--check").arg(snapshot), Some(cancel))?;
+    if code == 0 { return Ok(false); }
+    if code != 3 { return Err("This PDF contains damaged data and could not be repaired. No output was saved.".into()); }
+    let candidate = tempfile::Builder::new().suffix(".pdf")
+        .tempfile_in(snapshot.parent().ok_or("Working folder unavailable.")?)
+        .map_err(|_| "Cannot create a repair copy.")?;
+    let (repair_code, _) = run(
+        Command::new(engine).args(["--recompress-flate", "--compress-streams=y", "--object-streams=generate"])
+            .arg(snapshot).arg(candidate.path()), Some(cancel),
+    )?;
+    if ![0, 3].contains(&repair_code) { return Err("This PDF could not be repaired. No output was saved.".into()); }
+    validate_output(engine, candidate.path(), expected, cancel)
+        .map_err(|error| if error.starts_with("Cancelled") { error } else { "This PDF could not be repaired safely. No output was saved.".into() })?;
+    let destination = File::options().read(true).write(true).open(snapshot)
+        .map_err(|_| "Cannot update the working copy.")?;
+    copy_into(candidate.path(), &destination, Some(cancel))?;
+    Ok(true)
+}
+
 fn validate_output(
     engine: &Path,
     output: &Path,
@@ -753,8 +782,17 @@ fn select_paths(
         }
         let (encrypted, _) = run(Command::new(engine).arg("--is-encrypted").arg(file.path()), None)?;
         if encrypted == 0 {
-            let bytes = file.as_file().metadata().map_err(|_| "Cannot inspect PDF.")?.len();
-            return Ok(Selected { path, bytes, pages: 0, digest: source_digest, source_digest, working: Some(Arc::new(file)), features: Features::default(), locked: true });
+            let (requires_password, _) = run(Command::new(engine).arg("--requires-password").arg(file.path()), None)?;
+            if requires_password != 2 && requires_password != 3 {
+                let bytes = file.as_file().metadata().map_err(|_| "Cannot inspect PDF.")?.len();
+                return Ok(Selected { path, bytes, pages: 0, digest: source_digest, source_digest, working: Some(Arc::new(file)), features: Features::default(), locked: true });
+            }
+            let readable = tempfile::Builder::new().suffix(".pdf").tempfile_in(store.workspace.path()).map_err(|_| "Cannot open PDF.")?;
+            checked(Command::new(engine).arg("--decrypt").arg(file.path()).arg(readable.path()), None)?;
+            let mut document = inspect(engine, readable.path(), None)?;
+            document.path = path; document.bytes = file.as_file().metadata().map_err(|_| "Cannot inspect PDF.")?.len();
+            document.source_digest = source_digest; document.working = Some(Arc::new(readable));
+            return Ok(document);
         }
         let mut document = inspect(engine, file.path(), None)?;
         document.path = path; document.working = Some(Arc::new(file));
@@ -1014,6 +1052,7 @@ async fn process_documents(
         // Measurement uses private OS temporary storage; saving uses the destination filesystem.
         let workspace = store.workspace.job()?;
         let mut snapshots = Vec::new();
+        let mut recovered_inputs = Vec::new();
         for (index, document) in documents.iter().enumerate() {
             progress(&on_progress, format!("Preparing document {} of {}...", index + 1, documents.len()), true);
             cancelled(Some(&cancel))?;
@@ -1021,6 +1060,9 @@ async fn process_documents(
             copy_into(document.working_path(), snapshot.as_file(), Some(&cancel))?;
             let verified = inspect(&engine, snapshot.path(), Some(&cancel))?;
             if verified.digest != document.digest || verified.pages != document.pages || verified.bytes != fs::metadata(document.working_path()).map_err(|_| "Working copy unavailable.")?.len() { return Err("An input document changed. Remove it and add it again.".into()); }
+            progress(&on_progress, format!("Checking document {} of {}...", index + 1, documents.len()), true);
+            recovered_inputs.push(repair_snapshot_if_needed(&engine, snapshot.path(), document.pages as usize, &cancel)
+                .map_err(|error| if error.starts_with("Cancelled") { error } else { format!("Document {}: {error}", index + 1) })?);
             if document.features.signatures || (page_operation && document.features.forms) {
                 let prepared = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot prepare forms.")?;
                 let mut command = Command::new(&engine);
@@ -1043,7 +1085,7 @@ async fn process_documents(
             } else { None }
         } else { None };
         let mut outputs = Vec::new(); let mut output_bytes = 0u64; let mut sizes = Vec::new();
-        let mut recovered = cached.as_ref().is_some_and(|preview| preview.recovered);
+        let mut recovered = recovered_inputs.iter().any(|repaired| *repaired) || cached.as_ref().is_some_and(|preview| preview.recovered);
         for index in 0..jobs {
             progress(&on_progress, if jobs == 1 { "Processing the PDF locally...".into() } else { format!("Creating PDF {} of {jobs}...", index + 1) }, true);
             let output = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot create temporary output.")?;
@@ -1122,7 +1164,7 @@ async fn process_documents(
                 } else { optimize_images(&engine, &output, workspace.path(), request.compression, expected, None, &cancel)?; }
                 size = validate_output(&engine, output.path(), expected, &cancel)?;
             }
-            if request.operation == Operation::Compress && !documents[index].features.signatures && size >= fs::metadata(snapshots[index].path()).map_err(|_| "Working copy unavailable.")?.len() {
+            if request.operation == Operation::Compress && !documents[index].features.signatures && !recovered_inputs[index] && size >= fs::metadata(snapshots[index].path()).map_err(|_| "Working copy unavailable.")?.len() {
                 copy_into(snapshots[index].path(), output.as_file(), Some(&cancel))?; size = fs::metadata(snapshots[index].path()).map_err(|_| "Working copy unavailable.")?.len();
             } else { recovered |= code == 3; }
             output.as_file().sync_all().map_err(|_| "Cannot finish writing the PDF.")?;
@@ -1387,8 +1429,7 @@ async fn install_app_update(
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(Arc::new(Store { workspace: workspace::Workspace::new().expect("Cannot initialize private storage"),
-            documents: Mutex::default(), dropped_paths: Mutex::default(), operation: Mutex::default(), job: Mutex::default(), results: Mutex::default(), compression_preview: Mutex::default(), pending_update: Mutex::default() }))
+        .manage(Store::new().expect("Cannot initialize private storage"))
         // Tauri routes the main window's webview drops through WindowEvent.
         .on_window_event(|window, event| {
             #[cfg(target_os = "macos")]
@@ -1444,4 +1485,115 @@ fn main() {
                 };
             }
         });
+}
+#[cfg(test)]
+mod stream_repair_tests {
+    use super::*;
+    const CONTENT: &[u8] = b"BT /F1 12 Tf 72 720 Td (Synthetic credit report fixture) Tj ET\n";
+    const DAMAGED: &[u8] = &[120,156,114,10,81,208,119,51,84,48,52,82,8,73,83,48,55,2,34,3,133,144,20,5,141,224,202,188,146,140,212,146,204,100,133,228,162,212,148,204,18,133,162,212,130,252,162,18,133,180,204,138,146,210,162,84,77,133,144,44,5,215,16,46,0,0,0,0,255,255];
+    const VALID: &[u8] = &[120,156,115,10,81,208,119,51,84,48,52,82,8,73,83,48,55,2,34,3,133,144,20,5,141,224,202,188,146,140,212,146,204,100,133,228,162,212,148,204,18,133,162,212,130,252,162,18,133,180,204,138,146,210,162,84,77,133,144,44,5,215,16,46,0,51,230,19,31];
+    fn engine_path() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("engine/qpdf") }
+    fn fixture(stream: &[u8], path: &Path) {
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+            [format!("<< /Length {} /Filter /FlateDecode >>\nstream\n", stream.len()).into_bytes(), stream.to_vec(), b"\nendstream".to_vec()].concat(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec(); let mut offsets = vec![0];
+        for (i, object) in objects.iter().enumerate() { offsets.push(pdf.len()); pdf.extend_from_slice(format!("{} 0 obj\n", i+1).as_bytes()); pdf.extend(object); pdf.extend_from_slice(b"\nendobj\n"); }
+        let start = pdf.len(); pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len()+1).as_bytes());
+        for offset in offsets.iter().skip(1) { pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes()); }
+        pdf.extend_from_slice(format!("trailer\n<< /Root 1 0 R /Size {} >>\nstartxref\n{}\n%%EOF\n", objects.len()+1, start).as_bytes()); fs::write(path,pdf).unwrap();
+    }
+    #[test]
+    fn repairs_unfinished_flate_and_preserves_content() {
+        let directory = tempfile::tempdir().unwrap(); let path = directory.path().join("working.pdf"); fixture(DAMAGED, &path);
+        let engine=engine_path(); let cancel=AtomicBool::new(false);
+        assert_eq!(run(Command::new(&engine).arg("--check").arg(&path),Some(&cancel)).unwrap().0,3);
+        assert!(repair_snapshot_if_needed(&engine,&path,1,&cancel).unwrap());
+        assert_eq!(run(Command::new(&engine).arg("--check").arg(&path),Some(&cancel)).unwrap().0,0);
+        let json: serde_json::Value=serde_json::from_slice(&checked(Command::new(&engine).arg("--json").arg(&path),Some(&cancel)).unwrap()).unwrap();
+        let object=json["pages"][0]["contents"][0].as_str().unwrap().split_whitespace().next().unwrap();
+        let decoded=checked(Command::new(&engine).arg(format!("--show-object={object}")).arg("--filtered-stream-data").arg(&path),Some(&cancel)).unwrap();
+        assert_eq!(decoded,CONTENT);
+    }
+    #[test]
+    fn clean_snapshot_remains_byte_identical() {
+        let directory=tempfile::tempdir().unwrap(); let path=directory.path().join("clean.pdf");fixture(VALID,&path);let before=fs::read(&path).unwrap();
+        assert!(!repair_snapshot_if_needed(&engine_path(),&path,1,&AtomicBool::new(false)).unwrap());assert_eq!(before,fs::read(path).unwrap());
+    }
+    #[test]
+    fn failed_validation_leaves_snapshot_unchanged() {
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("working.pdf");fixture(DAMAGED,&path);let before=fs::read(&path).unwrap();
+        assert!(repair_snapshot_if_needed(&engine_path(),&path,2,&AtomicBool::new(false)).is_err());assert_eq!(before,fs::read(path).unwrap());
+    }
+    #[test]
+    fn cancellation_leaves_snapshot_unchanged() {
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("working.pdf");fixture(DAMAGED,&path);let before=fs::read(&path).unwrap();
+        let result=repair_snapshot_if_needed(&engine_path(),&path,1,&AtomicBool::new(true));assert!(result.unwrap_err().starts_with("Cancelled"));assert_eq!(before,fs::read(path).unwrap());
+    }
+    #[test]
+    fn fatal_stream_damage_is_rejected() {
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("working.pdf");fixture(b"not-a-compressed-stream",&path);let before=fs::read(&path).unwrap();
+        assert!(repair_snapshot_if_needed(&engine_path(),&path,1,&AtomicBool::new(false)).is_err());assert_eq!(before,fs::read(path).unwrap());
+    }
+    #[test]
+    fn repaired_snapshot_works_in_each_pdf_operation() {
+        let directory=tempfile::tempdir().unwrap();let input=directory.path().join("working.pdf");fixture(DAMAGED,&input);let engine=engine_path();let cancel=AtomicBool::new(false);
+        repair_snapshot_if_needed(&engine,&input,1,&cancel).unwrap();
+        let source=input.to_str().unwrap();
+        for (index, (args, pages)) in [
+            (vec!["--empty","--pages",source,"1-z",source,"1","--"],2),
+            (vec!["--empty","--pages",source,"1","--"],1),
+            (vec!["--rotate=+90:1","--empty","--pages",source,"1","--"],1),
+            (vec!["--recompress-flate","--compress-streams=y",source],1),
+        ].iter().enumerate() {
+            let output=directory.path().join(format!("result-{index}.pdf"));checked(Command::new(&engine).args(args).arg(&output),Some(&cancel)).unwrap();validate_output(&engine,&output,*pages,&cancel).unwrap();
+        }
+    }
+    #[test]
+    #[ignore = "Requires an explicitly supplied local PDF; never stores it in the repository"]
+    fn local_document_repair() {
+        let original=PathBuf::from(std::env::var_os("PDF_TOOLS_LOCAL_CHECK").expect("Supply a local PDF path"));
+        let engine=engine_path(); let cancel=AtomicBool::new(false);
+        let before=digest(&original,Some(&cancel)).unwrap(); let pages=count_pages(&engine,&original,Some(&cancel)).unwrap();
+        let directory=tempfile::tempdir().unwrap(); let working=directory.path().join("working.pdf");fs::copy(&original,&working).unwrap();
+        assert!(repair_snapshot_if_needed(&engine,&working,pages as usize,&cancel).unwrap());
+        let output=directory.path().join("merged.pdf");
+        checked(Command::new(&engine).args(["--empty","--pages"]).arg(&working).arg("1-z").arg(&working).args(["1","--"]).arg(&output),Some(&cancel)).unwrap();
+        validate_output(&engine,&output,pages as usize+1,&cancel).unwrap();
+        assert_eq!(before,digest(&original,Some(&cancel)).unwrap());
+    }
+
+    #[test]
+    fn encrypted_pdf_without_open_password_is_readable() {
+        let directory=tempfile::tempdir().unwrap(); let input=directory.path().join("input.pdf"); let encrypted=directory.path().join("encrypted.pdf");fixture(VALID,&input);let engine=engine_path();
+        checked(Command::new(&engine).args(["--encrypt","","synthetic-owner-password","256","--"]).arg(&input).arg(&encrypted),None).unwrap();
+        let store=Store::new().unwrap();let selected=select_paths(&store,&engine,vec![encrypted]).unwrap();
+        assert_eq!(selected.len(),1);assert!(!selected[0].locked);assert_eq!(selected[0].pages,1);
+    }
+    #[test]
+    fn encrypted_pdf_requiring_password_stays_locked() {
+        let directory=tempfile::tempdir().unwrap();let input=directory.path().join("input.pdf");let encrypted=directory.path().join("encrypted.pdf");fixture(VALID,&input);let engine=engine_path();
+        checked(Command::new(&engine).args(["--encrypt","synthetic-open-password","synthetic-owner-password","256","--"]).arg(&input).arg(&encrypted),None).unwrap();
+        let store=Store::new().unwrap();let selected=select_paths(&store,&engine,vec![encrypted]).unwrap();assert!(selected[0].locked);
+    }
+    #[test]
+    fn navigation_remaps_bookmarks_after_page_reordering() {
+        let directory=tempfile::tempdir().unwrap();let input=directory.path().join("input.pdf");fixture(VALID,&input);let engine=engine_path();let cancel=AtomicBool::new(false);
+        let source=directory.path().join("two-pages.pdf");checked(Command::new(&engine).args(["--empty","--pages"]).arg(&input).args(["1,1","--"]).arg(&source),Some(&cancel)).unwrap();
+        let mut document=inspect(&engine,&source,Some(&cancel)).unwrap();document.features.bookmarks=vec![Bookmark {title:"Income".into(),page:Some(1),children:vec![]},Bookmark {title:"Statements".into(),page:Some(2),children:vec![]}];
+        let output=tempfile::Builder::new().suffix(".pdf").tempfile_in(directory.path()).unwrap();
+        checked(Command::new(&engine).args(["--empty","--pages"]).arg(&source).args(["2,1","--"]).arg(output.path()),Some(&cancel)).unwrap();
+        preserve_navigation(&engine,&output,&[document],&[(0,2,0),(0,1,0)],directory.path(),&cancel).unwrap();
+        let result=inspect_features(&engine,output.path(),Some(&cancel)).unwrap();assert_eq!(result.bookmarks.len(),2);assert_eq!(result.bookmarks[0].page,Some(2));assert_eq!(result.bookmarks[1].page,Some(1));
+    }
+    #[test]
+    fn another_instance_does_not_delete_live_working_files() {
+        let first=workspace::Workspace::new().unwrap();let marker=first.path().join("synthetic-marker");fs::write(&marker,b"fixture").unwrap();
+        let second=workspace::Workspace::new().unwrap();assert!(marker.is_file());drop(second);assert!(marker.is_file());
+    }
+
 }

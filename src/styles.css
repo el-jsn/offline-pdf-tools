@@ -989,6 +989,13 @@ input[aria-invalid=true] { border-color:var(--error); }
 }
 #jump-page { width:64px; }
 
+.split-group { grid-template-columns:minmax(100px,.7fr) minmax(100px,1fr) auto auto; }
+.preview-panes.comparing, #preview-panes.comparing { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); grid-template-rows:minmax(0,1fr); }
+.preview-pane { min-width:0; }
+.preview-canvas { align-items:flex-start; }
+.preview-canvas canvas { max-width:none!important; flex-shrink:0; }
+@media(max-width:800px) { .split-group { grid-template-columns:minmax(100px,1fr) minmax(100px,1fr); } }
+
 :root[data-appearance=dark] {
   color-scheme:dark;
   --text:#f5f5f7;

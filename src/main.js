@@ -22,7 +22,7 @@ const tools = {
 };
 const state = Object.fromEntries(Object.keys(tools).map((tool) => [tool, {
   documents: [], pages: [], selected: new Set(), history: [], future: [], pageWindow: 0,
-  compressionPreview: null, measurementKey: null, measurementFailed: false, compression: 'balanced', targetSize: '', splitMode: 'selected', groupSize: '5', ranges: '', splitGroups: [''], activeGroup: 0, splitSeparate: false, splitCombine: false, splitCuts: '', flattenForms: false, acknowledgeChanges: false, result: null,
+  compressionPreview: null, measurementKey: null, measurementFailed: false, compression: 'balanced', targetSize: '', splitMode: 'selected', groupSize: '5', ranges: '', splitGroups: [''], splitNames: [''], activeGroup: 0, splitSeparate: false, splitCombine: false, splitCuts: '', flattenForms: false, acknowledgeChanges: false, result: null,
 }]));
 let mode = 'merge'; let busy = false; let ready = false; let jobId = null; let cancelAvailable = false; let lastSelected = null;
 let compressionTimer = null;
@@ -52,10 +52,9 @@ function changesFor(view) {
   const flatten = !blocked && pageOperation && any((features) => features.forms);
   const acknowledge = !blocked && (any((features) => features.signatures) || (pageOperation && any((features) => features.tags)));
   const notes = [];
-  if (flatten) notes.push('Form fields will be flattened in the saved copy.');
+  if (flatten) notes.push('Forms and annotations will become static.');
   if (any((features) => features.signatures)) notes.push('Signatures will be removed in the saved copy.');
-  if (pageOperation && any((features) => features.tags)) notes.push('Accessibility tags are not kept in the saved copy.');
-  if (['split', 'organize'].includes(mode) && any((features) => features.attachments > 0)) notes.push('Attachments are not kept in the saved copy.');
+  if (pageOperation && any((features) => features.tags)) notes.push('Page changes may remove accessibility tags.');
   return { blocked, flatten, acknowledge, notes };
 }
 function targetBytes(view) {
@@ -107,6 +106,7 @@ function controls() {
   $('compare-output').disabled = busy || !state.compress.compressionPreview || state.compress.documents.length !== 1;
   $('target-size').disabled = busy || view.compression === 'lossless';
   if (view.targetSize.trim() && targetBytes(view) === null) $('target-size').setAttribute('aria-invalid', 'true'); else $('target-size').removeAttribute('aria-invalid');
+  $('password-unlock').disabled = busy; $('password-skip').disabled = busy; $('pdf-password').disabled = busy;
   $('flatten-forms').disabled = busy; $('acknowledge-changes').disabled = busy;
   for (const control of document.querySelectorAll('.file-actions button, .page-actions button')) control.disabled = busy || control.dataset.boundary === 'true';
   $('save-label').textContent = mode === 'split' && view.splitMode === 'selected' ? 'Extract pages' : mode === 'compress' && view.compressionPreview ? (view.documents.length > 1 ? 'Save PDFs' : 'Save PDF') : mode === 'compress' && view.documents.length > 1 ? 'Compress PDFs' : tools[mode].action;
@@ -227,7 +227,7 @@ function renderPages() {
 function splitPlanFor(view) {
   if (view.splitMode === 'bookmarks') {
     const plan = bookmarkGroups(view.documents[0].features.bookmarks, view.documents[0].pages).map((group) => group.pages);
-    if (plan.flat().length > 20000) throw new Error('Choose at most 20,000 output pages in total.');
+    if (plan.length > 500 || plan.some((group) => group.length > 10000) || plan.flat().length > 20000) throw new Error('Choose at most 20,000 output pages in total.');
     return plan;
   }
   const ranges = view.splitMode === 'ranges' ? view.splitGroups.join(';') : view.splitMode === 'after' ? view.splitCuts : view.ranges;
@@ -236,6 +236,7 @@ function splitPlanFor(view) {
   return plan;
 }
 function splitOutputNames(view) {
+  if (view.splitMode === 'ranges' && !view.splitCombine) return view.splitGroups.map((_, i) => view.splitNames[i]?.trim() || `Group ${i + 1}`);
   if (view.splitMode !== 'bookmarks') return [];
   try { return bookmarkGroups(view.documents[0].features.bookmarks, view.documents[0].pages).map((group) => group.name); } catch { return []; }
 }
@@ -250,7 +251,7 @@ function writeSplitSelection() {
   const text = pageList([...view.selected].sort((a, b) => a - b)); view.result = null;
   if (view.splitMode === 'ranges') {
     view.splitGroups[view.activeGroup] = text;
-    $('split-group-list').querySelectorAll('input')[view.activeGroup].value = text;
+    $(`split-group-${view.activeGroup}`).value = text;
   } else if (view.splitMode === 'after') { view.splitCuts = text; $('split-cuts').value = text; }
   else { view.ranges = text; $('split-ranges').value = text; }
   splitSummary();
@@ -259,8 +260,8 @@ function renderSplitGroups() {
   const view = current(); $('split-group-list').replaceChildren();
   view.splitGroups.forEach((value, index) => {
     const row = document.createElement('div'); row.className = 'split-group'; row.classList.toggle('active', index === view.activeGroup);
-    const label = document.createElement('label'); label.htmlFor = `split-group-${index}`; label.textContent = `Group ${index + 1}`;
-    const input = document.createElement('input'); input.type = 'text'; input.id = label.htmlFor; input.value = value; input.placeholder = '1-3, 5, 8'; input.autocomplete = 'off'; input.spellcheck = false;
+    const label = document.createElement('input'); label.type = 'text'; label.className = 'group-name'; label.placeholder = `Group ${index + 1}`; label.value = view.splitNames[index] || ''; label.setAttribute('aria-label', `Group ${index + 1} name`); label.maxLength = 80; label.addEventListener('input', () => { view.splitNames[index] = label.value; view.result = null; splitSummary(); });
+    const input = document.createElement('input'); input.type = 'text'; input.id = `split-group-${index}`; input.setAttribute('aria-label', `Group ${index + 1} pages`); input.value = value; input.placeholder = '1-3, 5, 8'; input.autocomplete = 'off'; input.spellcheck = false;
     const activate = () => {
       if (busy) return;
       view.activeGroup = index; lastSelected = null;
@@ -271,9 +272,9 @@ function renderSplitGroups() {
     input.addEventListener('input', () => { view.splitGroups[index] = input.value; view.result = null; readSplitSelection(); splitSummary(); updateSelection(); });
     const select = document.createElement('button'); select.className = 'secondary'; select.textContent = 'Choose pages'; select.addEventListener('click', activate);
     const actions = document.createElement('div'); actions.className = 'file-actions';
-    const move = (offset) => { if (busy) return; view.splitGroups.splice(index + offset, 0, view.splitGroups.splice(index, 1)[0]); view.activeGroup = index + offset; view.result = null; lastSelected = null; render(); };
+    const move = (offset) => { if (busy) return; view.splitGroups.splice(index + offset, 0, view.splitGroups.splice(index, 1)[0]); view.splitNames.splice(index + offset, 0, view.splitNames.splice(index, 1)[0]); view.activeGroup = index + offset; view.result = null; lastSelected = null; render(); };
     actions.append(actionButton(`Move group ${index + 1} earlier`, 'up', () => move(-1), index === 0), actionButton(`Move group ${index + 1} later`, 'down', () => move(1), index === view.splitGroups.length - 1));
-    actions.append(actionButton(`Remove group ${index + 1}`, 'trash', () => { if (busy) return; view.splitGroups.splice(index, 1); view.activeGroup = Math.min(view.activeGroup, view.splitGroups.length - 1); view.result = null; lastSelected = null; render(); }, view.splitGroups.length === 1));
+    actions.append(actionButton(`Remove group ${index + 1}`, 'trash', () => { if (busy) return; view.splitGroups.splice(index, 1); view.splitNames.splice(index, 1); view.activeGroup = Math.min(view.activeGroup, view.splitGroups.length - 1); view.result = null; lastSelected = null; render(); }, view.splitGroups.length === 1));
     row.append(label, input, select, actions); $('split-group-list').append(row);
   });
 }
@@ -291,7 +292,7 @@ function splitSummary() {
     if (plan.length > 20) { const item = document.createElement('li'); item.textContent = `${plan.length - 20} more PDFs`; $('split-output-list').append(item); }
   } catch (error) {
     $('split-summary').textContent = error.message; $('split-summary').className = 'context-note invalid'; $('split-output-details').hidden = true;
-    if (view.splitMode === 'ranges') view.splitGroups.forEach((range, index) => { try { parseRange(range, view.documents[0].pages); } catch { $('split-group-list').querySelectorAll('input')[index].setAttribute('aria-invalid', 'true'); } });
+    if (view.splitMode === 'ranges') view.splitGroups.forEach((range, index) => { try { parseRange(range, view.documents[0].pages); } catch { $(`split-group-${index}`).setAttribute('aria-invalid', 'true'); } });
     else if (view.splitMode !== 'bookmarks') $(view.splitMode === 'after' ? 'split-cuts' : view.splitMode === 'groups' ? 'group-size' : 'split-ranges').setAttribute('aria-invalid', 'true');
   }
   controls();
@@ -374,7 +375,7 @@ async function acceptSelection(selected, insertionIndex) {
     view.documents = selected;
     view.pages = ['organize', 'split'].includes(mode) ? Array.from({ length: selected[0].pages }, (_, index) => ({ page: index + 1, rotation: 0 })) : [];
     view.selected.clear(); view.history = []; view.pageWindow = 0; lastSelected = null;
-    if (mode === 'split') { view.ranges = ''; view.splitGroups = ['']; view.activeGroup = 0; view.splitCuts = ''; $('split-ranges').value = ''; $('split-cuts').value = ''; }
+    if (mode === 'split') { view.ranges = ''; view.splitGroups = ['']; view.splitNames = ['']; view.activeGroup = 0; view.splitCuts = ''; $('split-ranges').value = ''; $('split-cuts').value = ''; }
   }
   resetEdits(view); view.result = null;
   for (const doc of selected) await previews.forget(doc.id);
@@ -476,23 +477,26 @@ function compressionSummary() {
   const measured = view.compressionPreview;
   if (!measured) {
     host.removeAttribute('title');
-    host.textContent = view.measurementFailed ? 'Size unavailable' : 'Calculating output size...';
+    host.classList.remove('invalid'); host.textContent = !validation() ? '' : view.measurementFailed ? 'Size unavailable' : 'Calculating output size...';
     return;
   }
   const saved = measured.inputBytes - measured.outputBytes;
   host.textContent = saved > 0 ? `Expected output: ${bytes(measured.outputBytes)}, saves ${bytes(saved)}` : `Expected output: ${bytes(measured.outputBytes)}, already optimized`;
+  const limit = targetBytes(view);
+  if (limit && measured.fileBytes.some((size) => size > limit)) host.textContent += ' — Over limit';
+  host.classList.toggle('invalid', Boolean(limit && measured.fileBytes.some((size) => size > limit)));
   host.title = `${measured.outputBytes.toLocaleString()} bytes${measured.files > 1 ? ' total' : ''}`;
 }
 function scheduleCompression() {
   clearTimeout(compressionTimer);
-  if (mode !== 'compress' || busy || !ready || !current().documents.length) return;
+  if (mode !== 'compress' || busy || !ready || !current().documents.length || !validation()) return;
   const view = current();
   const key = JSON.stringify([view.compression, view.targetSize, view.acknowledgeChanges, view.documents.map((doc) => doc.id)]);
   if (view.measurementKey === key) return;
   compressionTimer = setTimeout(() => measureCompression(key), 250);
 }
 async function measureCompression(key) {
-  if (mode !== 'compress' || busy || !ready || !current().documents.length) return;
+  if (mode !== 'compress' || busy || !ready || !current().documents.length || !validation()) return;
   const view = current();
   if (key !== JSON.stringify([view.compression, view.targetSize, view.acknowledgeChanges, view.documents.map((doc) => doc.id)])) return;
   view.measurementKey = key; view.measurementFailed = false; view.compressionPreview = null;
@@ -521,7 +525,7 @@ async function save() {
     const result = await invoke('process_documents', { request: { jobId, operation: mode, ids: outputDocuments(view).map((doc) => doc.id), compression: view.compression, previewId: view.compressionPreview?.id ?? null, splitMode: mode === 'split' ? 'ranges' : 'every_page', pagesPerFile: Number(view.groupSize), ranges: splitRanges, pages: view.pages.map((page) => ({ documentId: page.documentId || '', page: page.page, rotation: page.rotation })), targetBytes: mode === 'compress' ? targetBytes(view) : null, outputNames: mode === 'split' ? splitOutputNames(view) : [], flattenForms: view.flattenForms, acknowledgeChanges: view.acknowledgeChanges }, onProgress });
     if (!result) { message('Save cancelled.'); return; } view.result = result;
     let text = activeMode !== 'split' && result.files === 1 ? `Saved ${result.name}. ${bytes(result.outputBytes)}.` : `Saved ${result.files} PDFs in ${result.name}.`;
-    if (activeMode === 'compress') text += result.outputBytes < result.inputBytes ? ` ${Math.round((1 - result.outputBytes / result.inputBytes) * 100)}% smaller.` : ' Already optimized. Saved an unchanged copy.';
+    if (activeMode === 'compress') text += result.outputBytes < result.inputBytes ? ` ${Math.round((1 - result.outputBytes / result.inputBytes) * 100)}% smaller.` : result.recovered ? ' Saved a repaired copy.' : ' Already optimized. Saved an unchanged copy.';
     if (result.recovered) text += ' PDF data recovered; review the saved copy.';
     message(text, 'success');
   } catch (error) { message(String(error), String(error).startsWith('Cancelled') ? '' : 'error'); }
@@ -540,6 +544,7 @@ function editPages(action) {
 function duplicateSelected() {
   const view = current();
   if (busy || !view.selected.size) return;
+  if (view.pages.length + view.selected.size > 20000) { message('Keep at most 20,000 pages.', 'error'); return; }
   rememberEdit();
   const copies = [];
   view.pages = view.pages.flatMap((page) => {
@@ -569,7 +574,7 @@ function openCompare() {
   if (busy || !view.compressionPreview || view.documents.length !== 1 || $('preview-dialog').open) return;
   const doc = view.documents[0];
   previewSession = { doc, pages: null, index: 0, count: doc.pages, compare: { previewId: view.compressionPreview.id, outputIndex: 0, bytes: view.compressionPreview.fileBytes[0] } };
-  $('preview-title').textContent = 'Compare original and compressed';
+  $('preview-title').textContent = 'Compare';
   $('preview-zoom').value = '1';
   $('preview-dialog').showModal();
   renderPreview();
@@ -583,6 +588,7 @@ async function renderPreview() {
   if (!previewSession || !$('preview-dialog').open) return;
   const sequence = ++previewRenderSequence;
   const { doc, pages, index, count, compare } = previewSession;
+  $('compressed-pane').hidden = !compare; $('original-label').hidden = !compare; $('preview-panes').classList.toggle('comparing', Boolean(compare));
   const page = pages ? pages[index] : { page: index + 1, rotation: 0 };
   const source = pages ? state.organize.documents.find((item) => item.id === page.documentId) || doc : doc;
   if (pages) $('preview-title').textContent = source.name;
@@ -674,7 +680,8 @@ $('password-form').addEventListener('submit', async (event) => {
   busy = true; controls();
   let info;
   try {
-    info = await invoke('unlock_document', { id: doc.id, password: $('pdf-password').value });
+    const password = $('pdf-password').value; $('pdf-password').value = '';
+    info = await invoke('unlock_document', { id: doc.id, password });
   } catch (error) {
     $('password-error').textContent = String(error); $('password-error').hidden = false;
     busy = false; controls(); return;
@@ -703,7 +710,8 @@ $('password-form').addEventListener('submit', async (event) => {
   promptNextLocked();
 });
 $('password-skip').addEventListener('click', () => $('password-dialog').close());
-$('password-dialog').addEventListener('close', () => { pendingUnlock = null; });
+$('password-dialog').addEventListener('close', () => { pendingUnlock = null; $('pdf-password').value = ''; });
+$('password-dialog').addEventListener('cancel', (event) => { if (busy) event.preventDefault(); });
 async function fetchUpdate() {
   const update = await invoke('check_app_update');
   pendingUpdate = update; availableUpdateVersion = update?.version || null; updateChecks.remember(availableUpdateVersion); controls(); return update;
@@ -762,7 +770,7 @@ $('split-ranges').addEventListener('input', () => { current().ranges = $('split-
 $('split-cuts').addEventListener('input', () => { current().splitCuts = $('split-cuts').value; current().result = null; readSplitSelection(); splitSummary(); updateSelection(); });
 $('split-separate').addEventListener('change', () => { current().splitSeparate = $('split-separate').checked; current().result = null; splitSummary(); });
 $('split-combine').addEventListener('change', () => { current().splitCombine = $('split-combine').checked; current().result = null; splitSummary(); });
-$('add-split-group').addEventListener('click', () => { if (busy || current().splitGroups.length >= 500) return; const view = current(); view.splitGroups.push(''); view.activeGroup = view.splitGroups.length - 1; view.result = null; lastSelected = null; render(); $(`split-group-${view.activeGroup}`).focus(); });
+$('add-split-group').addEventListener('click', () => { if (busy || current().splitGroups.length >= 500) return; const view = current(); view.splitGroups.push(''); view.splitNames.push(''); view.activeGroup = view.splitGroups.length - 1; view.result = null; lastSelected = null; render(); $(`split-group-${view.activeGroup}`).focus(); });
 $('invert-selection').addEventListener('click', () => { if (busy) return; const view = current(); view.selected = new Set(view.pages.filter((page) => !view.selected.has(pageKey(page))).map(pageKey)); lastSelected = null; writeSplitSelection(); updateSelection(); });
 $('select-all').addEventListener('click', () => { if (busy) return; const view = current(); view.selected = view.selected.size === view.pages.length ? new Set() : new Set(view.pages.map(pageKey)); lastSelected = null; if (mode === 'split') writeSplitSelection(); updateSelection(); });
 $('rotate-left').addEventListener('click', () => editPages('rotate-left'));

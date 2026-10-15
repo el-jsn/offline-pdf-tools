@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { getDocument, GlobalWorkerOptions, PDFDataRangeTransport } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import workerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -33,18 +33,20 @@ export class Previews {
     host.previewSpec = { id, page, rotation, width: 150, bytes }; this.observer.observe(host);
   }
   key(spec) { return spec.previewId ? `preview:${spec.previewId}:${spec.outputIndex ?? 0}` : spec.id; }
-  async readSource(spec) {
-    const total = Math.max(0, Number(spec.bytes) || 0);
-    const parts = [];
-    for (let begin = 0; begin < total; begin += CHUNK) {
-      const end = Math.min(begin + CHUNK, total);
-      const chunk = await invoke('read_document_range', { id: spec.id || '', begin, end, previewId: spec.previewId || null, outputIndex: spec.outputIndex ?? null });
-      parts.push(new Uint8Array(chunk));
-    }
-    const data = new Uint8Array(total);
-    let offset = 0;
-    for (const part of parts) { data.set(part, offset); offset += part.length; }
-    return data;
+  async rangeSource(spec, entry) {
+    const total = Number(spec.bytes);
+    if (!Number.isSafeInteger(total) || total < 1 || total > 250 * 1024 * 1024) throw new Error('Preview unavailable');
+    const read = async (begin, end) => new Uint8Array(await invoke('read_document_range', { id: spec.id || '', begin, end, previewId: spec.previewId || null, outputIndex: spec.outputIndex ?? null }));
+    const initial = await read(0, Math.min(CHUNK, total));
+    const transport = new PDFDataRangeTransport(total, initial);
+    transport.requestDataRange = (begin, end) => {
+      (async () => {
+        const data = new Uint8Array(end - begin);
+        for (let offset = begin; offset < end; offset += CHUNK) data.set(await read(offset, Math.min(offset + CHUNK, end)), offset - begin);
+        transport.onDataRange(begin, data);
+      })().catch(() => { entry.task?.destroy().catch(() => {}); });
+    };
+    return transport;
   }
   async pdf(spec) {
     const key = this.key(spec);
@@ -57,10 +59,10 @@ export class Previews {
     if (this.cache.has(key)) return this.cache.get(key).promise;
     const entry = {}; this.cache.set(key, entry);
     entry.promise = (async () => {
-      const data = await this.readSource(spec);
+      const range = await this.rangeSource(spec, entry);
       const assets = new URL('/pdfjs/', window.location.href).href;
       entry.task = getDocument({
-        data, isEvalSupported: false, verbosity: 0,
+        range, rangeChunkSize: CHUNK, disableAutoFetch: true, disableStream: true, isEvalSupported: false, verbosity: 0,
         cMapUrl: `${assets}cmaps/`, cMapPacked: true, iccUrl: `${assets}iccs/`,
         standardFontDataUrl: `${assets}standard_fonts/`, wasmUrl: `${assets}wasm/`,
         useSystemFonts: true, enableXfa: false,
@@ -88,7 +90,7 @@ export class Previews {
       canvas.width = Math.ceil(viewport.width * ratio); canvas.height = Math.ceil(viewport.height * ratio);
       canvas.style.width = `${viewport.width}px`; canvas.style.height = `${viewport.height}px`;
       const task = pdfPage.render({ canvas, canvasContext: canvas.getContext('2d'), viewport,
-        transform: ratio === 1 ? undefined : [ratio, 0, 0, ratio, 0, 0], annotationMode: 0 });
+        transform: ratio === 1 ? undefined : [ratio, 0, 0, ratio, 0, 0], annotationMode: 1 });
       this.renders.add(task);
       try { await task.promise; } finally { this.renders.delete(task); }
       if (host.isConnected && generation === this.generation && host.previewTicket === ticket) host.replaceChildren(canvas);
