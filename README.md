@@ -90,6 +90,13 @@ Read-only metadata inspection accepts QPDF's warning-only status when its JSON a
 page-count results are valid. Fatal inspection errors and malformed metadata are
 rejected. This does not relax validation of saved outputs.
 
+If the existing qpdf repair still leaves warnings, a bundled pypdf 6.20.1 worker
+can reconnect ordinary flat form controls missing from the field tree. It rejects
+conflicting copies, repeated names, nested fields, XFA and signed documents.
+Decoded page content, resources, annotations, control appearances and saved values
+must survive the rewrite; the result must also pass a clean qpdf check. This
+fallback runs during processing only, without adding work to normal imports.
+
 Original quality uses qpdf's lossless structural compression and may produce little
 reduction. Balanced uses compress-pdf 0.1.0's Standard preset (150 DPI target,
 JPEG quality 60); Smaller uses More (72 DPI target, JPEG quality 60, RGB image

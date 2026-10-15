@@ -48,6 +48,7 @@ pub fn read_bounded(mut input: impl Read, limit: usize) -> io::Result<Capture> {
     Ok(Capture {bytes,truncated})
 }
 pub fn action(command: &Command) -> &'static str {
+    if matches!(std::path::Path::new(command.get_program()).file_name().and_then(|name| name.to_str()), Some("pypdf-repair" | "pypdf-repair.exe")) {return "pypdf guarded form repair";}
     if matches!(std::path::Path::new(command.get_program()).file_name().and_then(|name| name.to_str()), Some("compress-pdf" | "compress-pdf.exe")) {return "PDF compression";}
     if command.get_args().any(|arg| arg == "--prepare-forms") {return "PDFium form appearance preparation";}
     if command.get_program().to_string_lossy().ends_with("pdf-image-worker") || command.get_program().to_string_lossy().ends_with("pdf-image-worker.exe") {return "Image compression worker";}

@@ -138,6 +138,32 @@ fn check_field_tree(index: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+
+// Called only after the existing qpdf repair cannot produce a clean copy.
+// The isolated worker rejects nested/XFA/signed/conflicting forms, verifies
+// decoded page content, resources and widget appearances, and never logs data.
+pub(super) fn pypdf_fallback(engine: &Path, input: &Path, expected: usize, cancel: &AtomicBool) -> Result<tempfile::NamedTempFile, String> {
+    const ERROR: &str = "This PDF could not be repaired safely. No output was saved.";
+    let before = inspect_json(engine, input, Some(cancel))?;
+    let features = inspect_features(engine, input, Some(cancel))?;
+    if features.signatures || features.unsupported_forms { return Err(ERROR.into()); }
+    let worker = engine.parent().ok_or(ERROR)?.join("pypdf-repair")
+        .join(if cfg!(windows) { "pypdf-repair.exe" } else { "pypdf-repair" });
+    if !worker.is_file() { return Err(ERROR.into()); }
+    diagnostics::stage("Repair form with pypdf 6.20.1");
+    let workspace = tempfile::tempdir_in(input.parent().ok_or(ERROR)?).map_err(|_| ERROR)?;
+    let path = workspace.path().join("repaired.pdf");
+    checked(Command::new(worker).arg(input).arg(&path), Some(cancel))
+        .map_err(|error| if error.starts_with("Cancelled") { error } else { ERROR.into() })?;
+    validate_output(engine, &path, expected, cancel)?;
+    let after = inspect_json(engine, &path, Some(cancel))?;
+    check_field_tree(&after)?;
+    compression::retained_non_form_data(&before, &after)?;
+    let result = tempfile::Builder::new().suffix(".pdf").tempfile_in(input.parent().ok_or(ERROR)?)
+        .map_err(|_| ERROR)?;
+    fs::copy(&path, result.path()).map_err(|_| ERROR)?;
+    Ok(result)
+}
 fn appearance_patch(index: &Value) -> Result<Value, String> {
     check_field_tree(index)?;
     let all = objects(index)?;
@@ -375,6 +401,27 @@ mod tests {
         input["acroform"]["fields"][0]["fieldtype"]=json!("/Sig");
         input["acroform"]["fields"][0]["value"]=json!("8 0 R");
         assert!(duplicate_widget_patch(&input).unwrap().is_none());
+    }
+    #[test]
+    #[ignore = "Requires generated missing-field-tree fixtures; no document data is printed"]
+    fn supplied_pypdf_missing_fields() {
+        let source=PathBuf::from(std::env::var_os("PDF_TOOLS_PYPDF_INPUT").unwrap());
+        let expected=PathBuf::from(std::env::var_os("PDF_TOOLS_PYPDF_EXPECTED").unwrap());
+        let original=digest(&source,None).unwrap();
+        let directory=tempfile::tempdir().unwrap();
+        let engine=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("engine/qpdf");
+        let cancel=AtomicBool::new(false);
+        let snapshot=directory.path().join("working.pdf");fs::copy(&source,&snapshot).unwrap();
+        let pages=count_pages(&engine,&snapshot,None).unwrap();
+        assert!(repair_snapshot_if_needed(&engine,&snapshot,pages as usize,&cancel).unwrap());
+        let after=inspect_json(&engine,&snapshot,None).unwrap();
+        let expected=inspect_json(&engine,&expected,None).unwrap();
+        assert!(answers(&expected).unwrap()==answers(&after).unwrap(),"Saved answers changed");
+        check_field_tree(&after).unwrap();
+        validate_output(&engine,&snapshot,pages as usize,&cancel).unwrap();
+        assert!(digest(&source,None).unwrap()==original,"Original changed");
+        assert!(pypdf_fallback(&engine,&source,pages as usize+1,&cancel).is_err());
+        assert!(pypdf_fallback(&engine,&source,pages as usize,&AtomicBool::new(true)).unwrap_err().starts_with("Cancelled"));
     }
     #[test]
     #[ignore = "Requires an explicitly supplied local duplicate-widget form; never prints document contents"]

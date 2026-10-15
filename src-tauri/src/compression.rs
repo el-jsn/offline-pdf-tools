@@ -86,6 +86,13 @@ fn retained_document_data(
             "Compression could not preserve the saved form answers. No output was saved.".into(),
         );
     }
+    retained_non_form_data(before, after)
+}
+
+pub(super) fn retained_non_form_data(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Result<(), String> {
     let attachment_names = |index: &serde_json::Value| -> Vec<String> {
         index["attachments"]
             .as_object()

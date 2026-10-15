@@ -27,3 +27,19 @@ PDF_TOOLS_QPDF provides an absolute development executable override in debug
 builds only. Release builds use the bundled engine exclusively.
 
 Do not distribute a build with only this README in the engine directory.
+
+The guarded AcroForm fallback uses pypdf 6.20.1 (BSD-3-Clause), frozen with
+Python 3.12 and PyInstaller 6.22.3 into engine/pypdf-repair/. Users do not need
+Python. On each target OS/architecture, create a clean Python 3.12 venv, install
+scripts/pypdf-build-requirements.txt during developer setup, then run that venv's
+Python with scripts/build-pypdf-worker.py. The build script does not download.
+It stages Python, package and native dependency notices and hashes every file.
+The engine check also rejects a worker built from stale source.
+
+This fallback runs only when qpdf's existing repair leaves warnings. It supports
+flat, uniquely named page widgets with missing field-tree connections. Conflicting
+values/appearances, repeated names, nested fields, XFA and signed documents are
+rejected. It checks decoded page content, resources, annotations and form
+appearances, followed by a clean qpdf check and page-count/field-tree checks.
+It does not regenerate appearances or perform image compression. Windows runtime
+packaging and clean-machine verification remain pending.

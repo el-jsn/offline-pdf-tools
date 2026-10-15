@@ -1,0 +1,3 @@
+Dependency notices for the bundled standalone CPython runtime.
+Source: https://github.com/astral-sh/python-build-standalone/tree/c253d7c31726bf560341ec186ae9064b588af291
+Includes notices for native modules built into the runtime.

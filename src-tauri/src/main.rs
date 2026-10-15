@@ -572,21 +572,28 @@ fn repair_snapshot_if_needed(
     if code == 0 { return Ok(false); }
     if code != 3 { return Err("This PDF contains damaged data and could not be repaired. No output was saved.".into()); }
     diagnostics::stage("Repair input working copy");
-    let candidate = if let Some(reconnected)=forms::reconnect_duplicate_widgets(engine,snapshot,cancel)? {
-        reconnected
-    } else {
-        let candidate = tempfile::Builder::new().suffix(".pdf")
-            .tempfile_in(snapshot.parent().ok_or("Working folder unavailable.")?)
-            .map_err(|_| "Cannot create a repair copy.")?;
-        let (repair_code, _) = run(
-            Command::new(engine).args(["--recompress-flate", "--compress-streams=y", "--object-streams=generate"])
-                .arg(snapshot).arg(candidate.path()), Some(cancel),
-        )?;
-        if ![0, 3].contains(&repair_code) { return Err("This PDF could not be repaired. No output was saved.".into()); }
-        candidate
+    let primary = (|| -> Result<tempfile::NamedTempFile, String> {
+        let candidate = if let Some(reconnected)=forms::reconnect_duplicate_widgets(engine,snapshot,cancel)? {
+            reconnected
+        } else {
+            let candidate = tempfile::Builder::new().suffix(".pdf")
+                .tempfile_in(snapshot.parent().ok_or("Working folder unavailable.")?)
+                .map_err(|_| "Cannot create a repair copy.")?;
+            let (repair_code, _) = run(
+                Command::new(engine).args(["--recompress-flate", "--compress-streams=y", "--object-streams=generate"])
+                    .arg(snapshot).arg(candidate.path()), Some(cancel),
+            )?;
+            if ![0, 3].contains(&repair_code) { return Err("This PDF could not be repaired. No output was saved.".into()); }
+            candidate
+        };
+        validate_output(engine, candidate.path(), expected, cancel)?;
+        Ok(candidate)
+    })();
+    let candidate = match primary {
+        Ok(candidate) => candidate,
+        Err(error) if error.starts_with("Cancelled") => return Err(error),
+        Err(_) => forms::pypdf_fallback(engine, snapshot, expected, cancel)?,
     };
-    validate_output(engine, candidate.path(), expected, cancel)
-        .map_err(|error| if error.starts_with("Cancelled") { error } else { "This PDF could not be repaired safely. No output was saved.".into() })?;
     let destination = File::options().read(true).write(true).open(snapshot)
         .map_err(|_| "Cannot update the working copy.")?;
     copy_into(candidate.path(), &destination, Some(cancel))?;
