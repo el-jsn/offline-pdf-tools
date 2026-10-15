@@ -3,6 +3,9 @@
 mod workspace;
 mod image_import;
 mod size_split;
+mod destination;
+#[cfg(test)]
+mod acceptance;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -397,6 +400,14 @@ fn document_info(id: String, document: &Selected) -> DocumentInfo {
         locked: document.locked, features: document.features.clone() }
 }
 fn copy_into(source: &Path, destination: &File, cancel: Option<&AtomicBool>) -> Result<(), String> {
+    copy_bytes(source, destination, cancel, Some(MAX_BYTES))
+}
+// Outputs can combine many valid inputs. The per-input import cap must not
+// reject a verified merged document during navigation rewriting or saving.
+fn copy_output(source: &Path, destination: &File, cancel: Option<&AtomicBool>) -> Result<(), String> {
+    copy_bytes(source, destination, cancel, None)
+}
+fn copy_bytes(source: &Path, destination: &File, cancel: Option<&AtomicBool>, limit: Option<u64>) -> Result<(), String> {
     let mut input = File::open(source).map_err(|_| "Cannot read an input document.")?;
     let mut output = destination
         .try_clone()
@@ -418,7 +429,7 @@ fn copy_into(source: &Path, destination: &File, cancel: Option<&AtomicBool>) -> 
             break;
         }
         total += count as u64;
-        if total > MAX_BYTES {
+        if limit.is_some_and(|limit| total > limit) {
             return Err("An input document exceeds 250 MB. No output was saved.".into());
         }
         output
@@ -729,7 +740,7 @@ fn preserve_navigation(engine: &Path, output: &tempfile::NamedTempFile, document
     let mut argument=std::ffi::OsString::from("--update-from-json="); argument.push(patch.path());
     checked(Command::new(engine).arg(argument).arg("--object-streams=generate").arg(output.path()).arg(candidate.path()),Some(cancel))?;
     validate_output(engine,candidate.path(),layout.len(),cancel)?;
-    copy_into(candidate.path(),output.as_file(),Some(cancel))
+    copy_output(candidate.path(),output.as_file(),Some(cancel))
 }
 
 fn record_result(
@@ -1079,6 +1090,7 @@ async fn process_documents(
             if fs::symlink_metadata(&destination).is_ok() { return Err("Choose a new filename. Existing files are never overwritten.".into()); }
         }
         let parent = if request.measure_only || multiple_outputs { destination.as_path() } else { destination.parent().ok_or("Choose a valid output folder.")? };
+        let selected_destination = destination::Destination::capture(parent)?;
         // Measurement uses private OS temporary storage; saving uses the destination filesystem.
         let workspace = store.workspace.job()?;
         let mut snapshots = Vec::new();
@@ -1226,6 +1238,7 @@ async fn process_documents(
             return Ok(Some(measured));
         }
         progress(&on_progress, "Saving verified output...", false);
+        selected_destination.verify()?;
         // After this point, a short publication step completes without cancellation.
         if multiple_outputs {
             let prefix = if request.operation == Operation::Split { "Split PDFs-" } else { "Compressed PDFs-" };
@@ -1238,16 +1251,18 @@ async fn process_documents(
                 } else { let fallback = format!("part-{:03}",index+1); let label = request.output_names.get(index).map_or(fallback.clone(), |s| workspace::safe_name(s, &fallback)); format!("{:03}-{label}.pdf",index+1) };
                 let path = folder.path().join(filename);
                 let staged = tempfile::Builder::new().suffix(".pdf").tempfile_in(folder.path()).map_err(|_| "Cannot save PDF.")?;
-                copy_into(output.path(), staged.as_file(), None)?;
+                copy_output(output.path(), staged.as_file(), None)?;
                 staged.persist_noclobber(&path).map_err(|_| "Cannot save PDFs. No output folder was retained.")?;
                 output_paths.push(path);
             }
+            selected_destination.verify()?;
             let path = folder.keep();
             Ok(Some(record_result(&store, path, output_paths, jobs, input_bytes, output_bytes, recovered)?))
         } else {
             let output = outputs.pop().ok_or("No PDF was produced.")?;
             let staged = tempfile::Builder::new().prefix(".pdf-tools-save-").tempfile_in(parent).map_err(|_| "Cannot save PDF.")?;
-            copy_into(output.path(), staged.as_file(), None)?;
+            copy_output(output.path(), staged.as_file(), None)?;
+            selected_destination.verify()?;
             staged.persist_noclobber(&destination).map_err(|_| "Cannot save the PDF. Choose a new filename and a writable folder.")?;
             Ok(Some(record_result(&store, destination.clone(), vec![destination], 1, input_bytes, output_bytes, recovered)?))
         }
