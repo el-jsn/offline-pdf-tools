@@ -2,6 +2,7 @@
 
 mod workspace;
 mod image_import;
+mod size_split;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -125,6 +126,7 @@ enum SplitMode {
     EveryPage,
     Groups,
     Ranges,
+    FileSize,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,6 +157,7 @@ struct Request {
     #[serde(default)]
     preview_id: Option<String>,
     #[serde(default)] target_bytes: Option<u64>,
+    #[serde(default)] max_output_bytes: Option<u64>,
     #[serde(default)] output_names: Vec<String>,
     #[serde(default)] flatten_forms: bool,
     #[serde(default)] acknowledge_changes: bool,
@@ -461,6 +464,7 @@ fn parse_range(value: &str, total: u32) -> Result<Vec<u32>, String> {
 }
 fn split_plan(request: &Request, total: u32) -> Result<Vec<Vec<u32>>, String> {
     let result = match request.split_mode {
+        SplitMode::FileSize => vec![(1..=total).collect()],
         SplitMode::Ranges => {
             if request.ranges.len() > 20000 {
                 return Err("The page range list is too long.".into());
@@ -705,10 +709,10 @@ fn preserve_navigation(engine: &Path, output: &tempfile::NamedTempFile, document
         changes.insert(format!("obj:{outline_root}"),serde_json::json!({"value":{"/Type":"/Outlines","/First":first,"/Last":last,"/Count":count}})); root["/Outlines"]=outline_root.into();
     } else if let Some(root)=root.as_object_mut() { root.remove("/Outlines"); }
     changes.insert(root_key,serde_json::json!({"value":root}));
-    let patch=workspace.join("navigation.json");
-    fs::write(&patch,serde_json::to_vec(&serde_json::json!({"qpdf":[{"jsonversion":2},changes]})).map_err(|_| "Cannot preserve navigation.")?).map_err(|_| "Cannot preserve navigation.")?;
+    let patch=tempfile::Builder::new().suffix(".json").tempfile_in(workspace).map_err(|_| "Cannot preserve navigation.")?;
+    serde_json::to_writer(patch.as_file(), &serde_json::json!({"qpdf":[{"jsonversion":2},changes]})).map_err(|_| "Cannot preserve navigation.")?;
     let candidate=tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace).map_err(|_| "Cannot preserve navigation.")?;
-    let mut argument=std::ffi::OsString::from("--update-from-json="); argument.push(patch);
+    let mut argument=std::ffi::OsString::from("--update-from-json="); argument.push(patch.path());
     checked(Command::new(engine).arg(argument).arg(output.path()).arg(candidate.path()),Some(cancel))?;
     validate_output(engine,candidate.path(),layout.len(),cancel)?;
     copy_into(candidate.path(),output.as_file(),Some(cancel))
@@ -759,16 +763,17 @@ async fn engine_status(app: tauri::AppHandle) -> Result<(), String> {
     .await
     .map_err(|_| "Engine check failed.")?
 }
-fn select_paths(
-    store: &Store,
-    engine: &Path,
-    paths: Vec<PathBuf>,
-) -> Result<Vec<DocumentInfo>, String> {
-    if paths.len() > MAX_DOCUMENTS {
-        return Err("Choose at most 100 documents at once.".into());
-    }
-    let selected = paths.iter().map(|path| {
-        let path = fs::canonicalize(path).map_err(|_| "Cannot access this PDF.")?;
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportResult {
+    documents: Vec<DocumentInfo>,
+    rejected: Vec<ImportFailure>,
+}
+#[derive(Serialize)]
+struct ImportFailure { name: String, reason: String }
+
+fn select_path(store: &Store, engine: &Path, path: &Path) -> Result<Selected, String> {
+        let path = fs::canonicalize(path).map_err(|_| "Cannot access this file.")?;
         let file = tempfile::Builder::new().suffix(".pdf").tempfile_in(store.workspace.path()).map_err(|_| "Cannot create a working copy.")?;
         copy_into(&path, file.as_file(), None)?;
         let source_digest = digest(file.path(), None)?;
@@ -797,36 +802,35 @@ fn select_paths(
         let mut document = inspect(engine, file.path(), None)?;
         document.path = path; document.working = Some(Arc::new(file));
         Ok(document)
-    }).collect::<Result<Vec<_>, String>>()?;
-    let mut stored = store
-        .documents
-        .lock()
-        .map_err(|_| "Document selection is unavailable.")?;
-    let new_count = selected
-        .iter()
-        .filter(|doc| {
-            !stored
-                .values()
-                .any(|old| old.path == doc.path && old.digest == doc.digest)
-        })
-        .count();
-    if stored.len() + new_count > MAX_DOCUMENTS {
-        return Err(
-            "Clear documents in another tool before selecting more than 100 documents.".into(),
-        );
+}
+fn select_paths(store: &Store, engine: &Path, paths: Vec<PathBuf>, allow_images: bool) -> Result<ImportResult, String> {
+    if paths.len() > MAX_DOCUMENTS { return Err("Choose at most 100 files at once.".into()); }
+    let mut result = ImportResult::default();
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for path in paths {
+        let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !seen.insert(identity) { continue; }
+        let pdf = path.extension().is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("pdf"));
+        let document = if !path.is_file() {
+            Err("Choose a readable file, not a folder.".into())
+        } else if !pdf && !(allow_images && image_import::supported(&path)) {
+            Err(if allow_images { "Choose a PDF, JPEG, PNG, or WebP image." } else { "Choose a PDF file." }.into())
+        } else { select_path(store, engine, &path) };
+        match document {
+            Ok(document) => selected.push(document),
+            Err(reason) => result.rejected.push(ImportFailure { name: name(&path), reason }),
+        }
     }
-    let mut result = Vec::new();
-    let mut added = HashSet::new();
+    let mut stored = store.documents.lock().map_err(|_| "Document selection is unavailable.")?;
     for document in selected {
-        if !added.insert(document.path.clone()) {
+        let existing = stored.iter().find(|(_, old)| old.path == document.path && old.digest == document.digest).map(|(id, _)| id.clone());
+        if existing.is_none() && stored.len() >= MAX_DOCUMENTS {
+            result.rejected.push(ImportFailure { name: name(&document.path), reason: "Clear unused documents before adding more than 100 files.".into() });
             continue;
         }
-        let existing = stored
-            .iter()
-            .find(|(_, old)| old.path == document.path && old.digest == document.digest)
-            .map(|(id, _)| id.clone());
         let id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        result.push(document_info(id.clone(), &document));
+        result.documents.push(document_info(id.clone(), &document));
         stored.insert(id, document);
     }
     Ok(result)
@@ -837,7 +841,7 @@ async fn import_dropped_documents(
     state: tauri::State<'_, Arc<Store>>,
     paths: Vec<String>,
     allow_images: bool,
-) -> Result<Vec<DocumentInfo>, String> {
+) -> Result<ImportResult, String> {
     let store = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _busy = store
@@ -845,7 +849,7 @@ async fn import_dropped_documents(
             .try_lock()
             .map_err(|_| "Another operation is in progress.")?;
         if paths.is_empty() || paths.len() > MAX_DOCUMENTS {
-            return Err("Drop between 1 and 100 PDFs.".into());
+            return Err("Drop between 1 and 100 files.".into());
         }
         let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
         {
@@ -860,18 +864,9 @@ async fn import_dropped_documents(
                 allowed.remove(path);
             }
         }
-        if paths.iter().any(|path| {
-            !path.is_file()
-                || !path
-                    .extension()
-                    .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("pdf"))
-                    && !(allow_images && image_import::supported(path))
-        }) {
-            return Err(if allow_images { "Choose PDFs, JPEG, PNG, or WebP images." } else { "Drop PDF files only." }.into());
-        }
         let engine = engine(&app)?;
         check_version(&engine)?;
-        select_paths(&store, &engine, paths)
+        select_paths(&store, &engine, paths, allow_images)
     })
     .await
     .map_err(|_| "PDF import failed.")?
@@ -883,7 +878,7 @@ async fn choose_documents(
     state: tauri::State<'_, Arc<Store>>,
     multiple: bool,
     allow_images: bool,
-) -> Result<Vec<DocumentInfo>, String> {
+) -> Result<ImportResult, String> {
     let store = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _busy = store
@@ -899,9 +894,9 @@ async fn choose_documents(
             dialog.pick_file().map(|path| vec![path])
         };
         let Some(paths) = paths else {
-            return Ok(Vec::new());
+            return Ok(ImportResult::default());
         };
-        select_paths(&store, &engine, paths)
+        select_paths(&store, &engine, paths, allow_images)
     })
     .await
     .map_err(|_| "Document selection failed.")?
@@ -983,6 +978,23 @@ fn discard_compression_preview(state: tauri::State<'_, Arc<Store>>) -> Result<()
         .map_err(|_| "Compression preview is unavailable.")? = None;
     Ok(())
 }
+fn make_size_part(engine: &Path, input: &Path, documents: &[Selected], first: u32, last: u32, workspace: &Path, cancel: &AtomicBool) -> Result<(tempfile::NamedTempFile, u64), String> {
+    cancelled(Some(cancel))?;
+    let output = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace).map_err(|_| "Cannot create temporary output.")?;
+    let path_text = |path: &Path| path.to_str().map(str::to_owned).ok_or_else(|| "Choose a folder with a valid Unicode name.".to_owned());
+    let job = serde_json::json!({ "inputFile": path_text(input)?, "outputFile": path_text(output.path())?, "pages": [{ "file": path_text(input)?, "range": format!("{first}-{last}") }] });
+    let config = tempfile::Builder::new().suffix(".json").tempfile_in(workspace).map_err(|_| "Cannot prepare the PDF operation.")?;
+    serde_json::to_writer(config.as_file(), &job).map_err(|_| "Cannot prepare the PDF operation.")?;
+    let mut argument = std::ffi::OsString::from("--job-json-file="); argument.push(config.path());
+    let (code, _) = run(Command::new(engine).arg(argument), Some(cancel))?;
+    if code != 0 && code != 3 { return Err("Cannot split this PDF by file size.".into()); }
+    validate_output(engine, output.path(), (last-first+1) as usize, cancel)?;
+    let layout: Vec<_> = (first..=last).map(|page| (0,page,0)).collect();
+    preserve_navigation(engine, &output, documents, &layout, workspace, cancel)?;
+    let size = validate_output(engine, output.path(), (last-first+1) as usize, cancel)?;
+    output.as_file().sync_all().map_err(|_| "Cannot finish writing the PDF.")?;
+    Ok((output, size))
+}
 #[tauri::command]
 async fn process_documents(
     app: tauri::AppHandle,
@@ -1017,7 +1029,10 @@ async fn process_documents(
         };
         if documents.iter().map(|doc| doc.pages as usize).sum::<usize>() > 20000 { return Err("Choose at most 20,000 input pages.".into()); }
         let multiple_outputs = request.operation == Operation::Split || (request.operation == Operation::Compress && documents.len() > 1);
-        let plan = if request.operation == Operation::Split { split_plan(&request, documents[0].pages)? } else { Vec::new() };
+        let mut plan = if request.operation == Operation::Split { split_plan(&request, documents[0].pages)? } else { Vec::new() };
+        if matches!(request.split_mode, SplitMode::FileSize) && (request.operation != Operation::Split || !request.max_output_bytes.is_some_and(|limit| (100_000..=250_000_000).contains(&limit))) {
+            return Err("Choose a file size limit between 0.1 and 250 MB.".into());
+        }
         if let Some(target) = request.target_bytes {
             if request.operation != Operation::Compress || !(100_000..=MAX_BYTES).contains(&target) || request.compression == Compression::Lossless { return Err("Choose a target between 0.1 and 250 MB with image compression.".into()); }
         }
@@ -1074,6 +1089,15 @@ async fn process_documents(
             }
             snapshots.push(snapshot);
         }
+        let sized_parts = if request.operation == Operation::Split && matches!(request.split_mode, SplitMode::FileSize) {
+            let parts = size_split::partition(documents[0].pages, request.max_output_bytes.unwrap(), MAX_OUTPUTS, |first, last| {
+                progress(&on_progress, format!("Measuring pages {first}-{last}..."), true);
+                make_size_part(&engine, snapshots[0].path(), &documents, first, last, workspace.path(), &cancel)
+            })?;
+            plan = parts.iter().map(|part| (part.first..=part.last).collect()).collect();
+            parts
+        } else { Vec::new() };
+        let mut sized_parts = sized_parts.into_iter();
         let input_bytes = documents.iter().map(|doc| doc.bytes).sum::<u64>();
         let jobs = if request.operation == Operation::Split { plan.len() } else if multiple_outputs { documents.len() } else { 1 };
         let cached = if request.operation == Operation::Compress && !request.measure_only {
@@ -1088,6 +1112,10 @@ async fn process_documents(
         let mut recovered = recovered_inputs.iter().any(|repaired| *repaired) || cached.as_ref().is_some_and(|preview| preview.recovered);
         for index in 0..jobs {
             progress(&on_progress, if jobs == 1 { "Processing the PDF locally...".into() } else { format!("Creating PDF {} of {jobs}...", index + 1) }, true);
+            if let Some(part) = sized_parts.next() {
+                output_bytes += part.bytes; sizes.push(part.bytes); outputs.push(part.output);
+                continue;
+            }
             let output = tempfile::Builder::new().suffix(".pdf").tempfile_in(workspace.path()).map_err(|_| "Cannot create temporary output.")?;
             if let Some(preview) = &cached {
                 copy_into(preview.outputs[index].path(), output.as_file(), Some(&cancel))?;
@@ -1571,14 +1599,14 @@ mod stream_repair_tests {
     fn encrypted_pdf_without_open_password_is_readable() {
         let directory=tempfile::tempdir().unwrap(); let input=directory.path().join("input.pdf"); let encrypted=directory.path().join("encrypted.pdf");fixture(VALID,&input);let engine=engine_path();
         checked(Command::new(&engine).args(["--encrypt","","synthetic-owner-password","256","--"]).arg(&input).arg(&encrypted),None).unwrap();
-        let store=Store::new().unwrap();let selected=select_paths(&store,&engine,vec![encrypted]).unwrap();
+        let store=Store::new().unwrap();let selected=select_paths(&store,&engine,vec![encrypted],false).unwrap().documents;
         assert_eq!(selected.len(),1);assert!(!selected[0].locked);assert_eq!(selected[0].pages,1);
     }
     #[test]
     fn encrypted_pdf_requiring_password_stays_locked() {
         let directory=tempfile::tempdir().unwrap();let input=directory.path().join("input.pdf");let encrypted=directory.path().join("encrypted.pdf");fixture(VALID,&input);let engine=engine_path();
         checked(Command::new(&engine).args(["--encrypt","synthetic-open-password","synthetic-owner-password","256","--"]).arg(&input).arg(&encrypted),None).unwrap();
-        let store=Store::new().unwrap();let selected=select_paths(&store,&engine,vec![encrypted]).unwrap();assert!(selected[0].locked);
+        let store=Store::new().unwrap();let selected=select_paths(&store,&engine,vec![encrypted],false).unwrap().documents;assert!(selected[0].locked);
     }
     #[test]
     fn navigation_remaps_bookmarks_after_page_reordering() {
@@ -1596,4 +1624,114 @@ mod stream_repair_tests {
         let second=workspace::Workspace::new().unwrap();assert!(marker.is_file());drop(second);assert!(marker.is_file());
     }
 
+}
+
+#[cfg(test)]
+mod import_batch_tests {
+    use super::*;
+    fn engine() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("engine/qpdf") }
+    fn fixture(directory: &Path) -> (PathBuf, PathBuf) {
+        let image = directory.join("image.png");
+        image::RgbImage::from_pixel(32, 16, image::Rgb([24, 80, 160])).save(&image).unwrap();
+        let pdf = directory.join("valid.PDF");
+        image_import::convert(&image, &pdf).unwrap();
+        (pdf, image)
+    }
+    #[test]
+    fn valid_files_survive_corrupt_and_unsupported_neighbors() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pdf, image) = fixture(directory.path());
+        let bad = directory.path().join("broken.pdf"); fs::write(&bad, b"invalid PDF").unwrap();
+        let other = directory.path().join("notes.txt"); fs::write(&other, b"synthetic note").unwrap();
+        let original_pdf = fs::read(&pdf).unwrap(); let original_image = fs::read(&image).unwrap();
+        let store = Store::new().unwrap();
+        let result = select_paths(&store, &engine(), vec![pdf.clone(), bad, image.clone(), other], true).unwrap();
+        assert_eq!(result.documents.iter().map(|doc| doc.name.as_str()).collect::<Vec<_>>(), ["valid.PDF", "image.png"]);
+        assert_eq!(result.rejected.iter().map(|failure| failure.name.as_str()).collect::<Vec<_>>(), ["broken.pdf", "notes.txt"]);
+        assert!(result.documents.iter().all(|doc| doc.pages == 1 && !doc.locked));
+        assert_eq!(store.documents.lock().unwrap().len(), 2);
+        assert_eq!(fs::read(pdf).unwrap(), original_pdf); assert_eq!(fs::read(image).unwrap(), original_image);
+        assert!(result.rejected.iter().all(|failure| !failure.reason.contains(directory.path().to_str().unwrap())));
+    }
+    #[test]
+    fn rejected_batch_preserves_existing_selection_and_releases_failed_snapshots() {
+        let directory = tempfile::tempdir().unwrap(); let (pdf, _) = fixture(directory.path());
+        let store = Store::new().unwrap();
+        let selected = select_paths(&store, &engine(), vec![pdf], false).unwrap();
+        let before = fs::read_dir(store.workspace.path()).unwrap().count();
+        let bad = directory.path().join("broken.pdf"); fs::write(&bad, b"invalid PDF").unwrap();
+        let result = select_paths(&store, &engine(), vec![bad], false).unwrap();
+        assert!(result.documents.is_empty()); assert_eq!(result.rejected.len(), 1);
+        assert!(store.documents.lock().unwrap().contains_key(&selected.documents[0].id));
+        assert_eq!(fs::read_dir(store.workspace.path()).unwrap().count(), before);
+    }
+    #[test]
+    fn duplicates_do_not_consume_capacity_and_existing_files_still_import_at_limit() {
+        let directory = tempfile::tempdir().unwrap(); let (pdf, _) = fixture(directory.path());
+        let store = Store::new().unwrap();
+        let result = select_paths(&store, &engine(), vec![pdf.clone(); 100], false).unwrap();
+        assert_eq!(result.documents.len(), 1); assert!(result.rejected.is_empty());
+        {
+            let mut docs = store.documents.lock().unwrap(); let source = docs.values().next().unwrap().clone();
+            for index in 1..100 { docs.insert(format!("fixture-{index}"), source.clone()); }
+        }
+        let second = directory.path().join("second.pdf"); fs::copy(&pdf, &second).unwrap();
+        let result = select_paths(&store, &engine(), vec![pdf, second], false).unwrap();
+        assert_eq!(result.documents.len(), 1); assert_eq!(result.rejected.len(), 1);
+        assert_eq!(result.rejected[0].name, "second.pdf");
+        assert_eq!(store.documents.lock().unwrap().len(), 100);
+    }
+    #[test]
+    fn pdf_only_tools_reject_images_and_folders_without_losing_valid_pdf() {
+        let directory = tempfile::tempdir().unwrap(); let (pdf, image) = fixture(directory.path());
+        let store = Store::new().unwrap();
+        let result = select_paths(&store, &engine(), vec![image, directory.path().to_path_buf(), pdf], false).unwrap();
+        assert_eq!(result.documents.len(), 1); assert_eq!(result.rejected.len(), 2);
+        assert_eq!(result.documents[0].name, "valid.PDF");
+        assert!(select_paths(&store, &engine(), vec![PathBuf::new(); 101], true).is_err());
+        assert_eq!(store.documents.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod size_split_pdf_tests {
+    use super::*;
+    #[test]
+    fn finished_pdfs_fit_and_preserve_every_page_with_navigation() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("engine/qpdf");
+        let mut inputs = Vec::new();
+        for (index, width) in [240, 256, 280].into_iter().enumerate() {
+            let mut seed = index as u32 + 42;
+            let image = image::RgbImage::from_fn(width, 280, |_,_| {
+                let mut pixel = [0;3];
+                for channel in &mut pixel { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; *channel = (seed >> 24) as u8; }
+                image::Rgb(pixel)
+            });
+            let source = directory.path().join(format!("image-{index}.png")); image.save(&source).unwrap();
+            let pdf = directory.path().join(format!("input-{index}.pdf")); image_import::convert(&source, &pdf).unwrap(); inputs.push(pdf);
+        }
+        let input = directory.path().join("input.pdf");
+        let mut command = Command::new(&engine); command.args(["--empty", "--pages"]);
+        for pdf in &inputs { command.arg(pdf).arg("1"); }
+        checked(command.arg("--").arg(&input), None).unwrap();
+        let before = digest(&input, None).unwrap(); let mut doc = inspect(&engine, &input, None).unwrap();
+        doc.features.bookmarks = (1..=3).map(|page| Bookmark { title: format!("Page {page}"), page: Some(page), children: vec![] }).collect();
+        let workspace = tempfile::tempdir().unwrap(); let cancel = AtomicBool::new(false);
+        let parts = size_split::partition(3, 250000, MAX_OUTPUTS, |first,last| make_size_part(&engine, &input, std::slice::from_ref(&doc), first,last, workspace.path(), &cancel)).unwrap();
+        assert_eq!(parts.len(), 3);
+        for (index, part) in parts.iter().enumerate() {
+            assert_eq!(part.first, index as u32 + 1); assert_eq!(part.last, part.first);
+            assert_eq!(part.bytes, fs::metadata(part.output.path()).unwrap().len()); assert!(part.bytes <= 250000);
+            validate_output(&engine, part.output.path(), 1, &cancel).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&checked(Command::new(&engine).arg("--json").arg(part.output.path()), None).unwrap()).unwrap();
+            assert_eq!(json["pages"][0]["images"][0]["width"].as_u64().unwrap(), [240,256,280][index]);
+            assert_eq!(json["outlines"][0]["title"].as_str().unwrap(), format!("Page {}", index+1));
+        }
+        drop(parts); assert_eq!(fs::read_dir(workspace.path()).unwrap().count(), 0);
+        let failed = size_split::partition(3, 100000, MAX_OUTPUTS, |first,last| make_size_part(&engine, &input, std::slice::from_ref(&doc), first,last, workspace.path(), &cancel));
+        assert!(failed.err().unwrap().starts_with("Page 1 exceeds"));
+        assert_eq!(fs::read_dir(workspace.path()).unwrap().count(), 0);
+        assert_eq!(digest(&input, None).unwrap(), before);
+    }
 }

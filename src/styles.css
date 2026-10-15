@@ -1034,3 +1034,13 @@ input[aria-invalid=true] { border-color:var(--error); }
 #preview-resize svg { width:16px; height:16px; fill:none; stroke:currentColor; stroke-width:1.5; }
 
 .file-drop-indicator { position:fixed; right:28px; bottom:84px; z-index:12; padding:9px 14px; border:1px solid var(--accent); border-radius:8px; background:var(--surface); color:var(--text); box-shadow:0 3px 16px #00000020; pointer-events:none; font-size:12px; font-weight:500; }
+
+#import-errors { margin-top:6px; font-size:12px; }
+#import-errors summary { cursor:pointer; display:flex; align-items:center; gap:4px; color:var(--error); list-style:none; }
+#import-errors summary::-webkit-details-marker { display:none; }
+#import-errors summary svg { width:14px; height:14px; flex:none; }
+#import-errors[open] summary svg { transform:rotate(90deg); }
+#import-errors ul { margin:6px 0 0; padding-left:18px; max-height:140px; overflow:auto; overflow-wrap:anywhere; }
+#import-errors li + li { margin-top:4px; }
+
+.status-content > div { min-width:0; }

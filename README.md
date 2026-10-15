@@ -11,9 +11,9 @@ Documents are never uploaded.
 - See the actual compressed size before saving and compare the original and compressed pages. Set an optional limit per PDF; an unmet limit is identified. Saving uses the measured output.
 - Preview source PDFs in all four tools with page navigation and zoom. Organize previews follow the current page order and rotations.
 - Organize pages with group dragging, edge scrolling, keyboard selection, previews, rotation, duplication, removal, undo/redo, and moves to a specific position.
-- Split with thumbnail selection, named page groups, fixed groups, every page, bookmarks, or page split points. Extract selected pages together or separately, combine custom groups, and preview output page lists.
+- Split with thumbnail selection, named page groups, fixed groups, file size limits, every page, bookmarks, or page split points. Extract selected pages together or separately, combine custom groups, and preview output page lists.
 - Choose System, Light, or Dark appearance in the sidebar.
-- Add files through drag and drop or the file picker.
+- Add files through drag and drop or the file picker. Invalid or unsupported files are listed individually; valid files in the same batch remain available.
 
 Original files are preserved. Outputs are saved as new files.
 
@@ -79,3 +79,5 @@ PDF processing and previews work offline. Update checks and installer downloads
 contact GitHub only when requested. Private working copies are removed when cleared or the app quits. Closing the Mac window keeps the current session in memory and its private workspace available. Abandoned private workspaces are reclaimed on a later launch; active instances are protected by file locks. A forced quit during the final output publication step can leave a staging file in the selected destination.
 
 Organize accepts PDFs and JPEG, PNG, or WebP images through Add files or file drops. Drop beside a page to insert there, or outside the grid to append. Added pages retain their source for previews and saving, and insertion can be undone.
+
+File size splitting uses decimal MB (1 MB = 1,000,000 bytes), measures completed outputs including bookmark changes, and preserves all pages in order. It does not reduce image quality. If one page cannot fit, the operation stops without publishing a partial output folder. The split need not use the fewest possible files.

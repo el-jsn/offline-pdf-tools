@@ -21,8 +21,8 @@ const tools = {
   organize: { heading: 'Organize pages', action: 'Save PDF' },
 };
 const state = Object.fromEntries(Object.keys(tools).map((tool) => [tool, {
-  documents: [], pages: [], selected: new Set(), history: [], future: [], pageWindow: 0,
-  compressionPreview: null, measurementKey: null, measurementFailed: false, compression: 'balanced', targetSize: '', splitMode: 'selected', groupSize: '5', ranges: '', splitGroups: [''], splitNames: [''], activeGroup: 0, splitSeparate: false, splitCombine: false, splitCuts: '', flattenForms: false, acknowledgeChanges: false, result: null,
+  documents: [], importErrors: [], pages: [], selected: new Set(), history: [], future: [], pageWindow: 0,
+  compressionPreview: null, measurementKey: null, measurementFailed: false, compression: 'balanced', targetSize: '', splitMode: 'selected', splitSize: '10', groupSize: '5', ranges: '', splitGroups: [''], splitNames: [''], activeGroup: 0, splitSeparate: false, splitCombine: false, splitCuts: '', flattenForms: false, acknowledgeChanges: false, result: null,
 }]));
 let mode = 'merge'; let busy = false; let ready = false; let jobId = null; let cancelAvailable = false; let lastSelected = null;
 let compressionTimer = null;
@@ -224,7 +224,13 @@ function renderPages() {
   $('page-window').textContent = view.pages.length ? `${start + 1}-${Math.min(start + PAGE_WINDOW, view.pages.length)} of ${view.pages.length}` : 'No pages';
   $('jump-page').max = String(view.pages.length); updateSelection();
 }
+function splitSizeBytes(view) {
+  const value = Number(view.splitSize), bytes = Math.floor(value * 1000000);
+  if (!Number.isFinite(value) || bytes < 100000 || bytes > 250000000) throw new Error('Choose a limit between 0.1 and 250 MB.');
+  return bytes;
+}
 function splitPlanFor(view) {
+  if (view.splitMode === 'file_size') { splitSizeBytes(view); return [Array.from({ length: view.documents[0].pages }, (_, index) => index + 1)]; }
   if (view.splitMode === 'bookmarks') {
     const plan = bookmarkGroups(view.documents[0].features.bookmarks, view.documents[0].pages).map((group) => group.pages);
     if (plan.length > 500 || plan.some((group) => group.length > 10000) || plan.flat().length > 20000) throw new Error('Choose at most 20,000 output pages in total.');
@@ -280,9 +286,13 @@ function renderSplitGroups() {
 }
 function splitSummary() {
   if (!current().documents.length) return;
-  const view = current(); $('split-output-list').replaceChildren();
+  const view = current(); $('split-output-list').replaceChildren(); $('split-summary').hidden = false;
   for (const input of $('split-options').querySelectorAll('input')) input.removeAttribute('aria-invalid');
   try {
+    if (view.splitMode === 'file_size') {
+      splitSizeBytes(view); $('split-summary').textContent = ''; $('split-summary').hidden = true;
+      $('split-summary').className = 'context-note'; $('split-output-details').hidden = true; controls(); return;
+    }
     const plan = splitPlanFor(view); const used = new Set(plan.flat()).size; const names = splitOutputNames(view);
     $('split-summary').textContent = `${plan.length} ${plan.length === 1 ? 'PDF' : 'PDFs'}, ${plan.flat().length} output pages${used < view.documents[0].pages ? `, ${view.documents[0].pages - used} pages excluded` : ''}.`;
     $('split-summary').className = 'context-note'; $('split-output-details').hidden = false;
@@ -293,7 +303,7 @@ function splitSummary() {
   } catch (error) {
     $('split-summary').textContent = error.message; $('split-summary').className = 'context-note invalid'; $('split-output-details').hidden = true;
     if (view.splitMode === 'ranges') view.splitGroups.forEach((range, index) => { try { parseRange(range, view.documents[0].pages); } catch { $(`split-group-${index}`).setAttribute('aria-invalid', 'true'); } });
-    else if (view.splitMode !== 'bookmarks') $(view.splitMode === 'after' ? 'split-cuts' : view.splitMode === 'groups' ? 'group-size' : 'split-ranges').setAttribute('aria-invalid', 'true');
+    else if (view.splitMode !== 'bookmarks') $(view.splitMode === 'file_size' ? 'split-size' : view.splitMode === 'after' ? 'split-cuts' : view.splitMode === 'groups' ? 'group-size' : 'split-ranges').setAttribute('aria-invalid', 'true');
   }
   controls();
 }
@@ -318,7 +328,7 @@ function render() {
   $('organizer-edits').hidden = mode !== 'organize'; $('move-pages-controls').hidden = mode !== 'organize'; $('organizer-selection').hidden = mode !== 'organize'; $('undo').hidden = mode !== 'organize'; $('redo').hidden = mode !== 'organize'; $('invert-selection').hidden = mode !== 'split';
   $('page-grid').classList.toggle('split-pages', mode === 'split'); $('page-grid').setAttribute('aria-label', mode === 'split' ? 'Source pages' : 'Pages in output order');
   $('organizer-tools').parentElement.setAttribute('aria-label', mode === 'split' ? 'Select pages for splitting' : 'Organize selected pages');
-  $('group-row').hidden = view.splitMode !== 'groups'; $('range-row').hidden = view.splitMode !== 'ranges'; $('selection-row').hidden = view.splitMode !== 'selected'; $('cut-row').hidden = view.splitMode !== 'after'; renderDocuments();
+  $('size-row').hidden = view.splitMode !== 'file_size'; $('group-row').hidden = view.splitMode !== 'groups'; $('range-row').hidden = view.splitMode !== 'ranges'; $('selection-row').hidden = view.splitMode !== 'selected'; $('cut-row').hidden = view.splitMode !== 'after'; renderDocuments();
   if (mode === 'split' && hasDocuments) { renderSplitGroups(); readSplitSelection(); }
   if (!$('organizer').hidden && hasDocuments) renderPages(); if (mode === 'split' && hasDocuments) splitSummary();
   if (mode === 'organize' && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) for (const card of $('page-grid').children) {
@@ -328,7 +338,7 @@ function render() {
   const total = view.documents.reduce((sum, doc) => sum + doc.bytes, 0);
   const pages = mode === 'organize' ? view.pages.length : view.documents.reduce((sum, doc) => sum + doc.pages, 0);
   $('summary').textContent = hasDocuments ? `${view.documents.length} ${view.documents.length === 1 ? 'document' : 'documents'}, ${pages} pages, ${bytes(total)}` : 'No PDFs selected';
-  renderChanges();
+  renderChanges(); renderImportErrors();
   controls(); scheduleCompression();
 }
 async function cleanRegistry() {
@@ -394,15 +404,35 @@ function promptNextLocked() {
   const locked = current().documents.find((doc) => doc.locked);
   if (locked) promptPassword(locked);
 }
+function showImportResult(result) {
+  const added = result.documents.length, skipped = result.rejected.length;
+  const parts = [];
+  if (added) parts.push(`${added} ${added === 1 ? 'file added' : 'files added'}`);
+  if (skipped) parts.push(`${skipped} ${skipped === 1 ? 'file skipped' : 'files skipped'}`);
+  message(parts.join('. ') || 'Selection cancelled.', skipped && !added ? 'error' : '');
+}
+function renderImportErrors() {
+  const report = $('import-errors'); const errors = current().importErrors;
+  report.hidden = !errors.length;
+  $('import-errors-summary').textContent = `${errors.length} ${errors.length === 1 ? 'file skipped' : 'files skipped'}`;
+  $('import-errors-list').replaceChildren(...errors.map((error) => {
+    const item = document.createElement('li');
+    const name = document.createElement('strong'); name.textContent = error.name;
+    item.append(name, document.createTextNode(`: ${error.reason}`)); return item;
+  }));
+}
 async function choose() {
   if (busy || !ready) return; busy = true; controls(); message(['merge', 'organize'].includes(mode) ? 'Select files' : 'Select PDFs');
-  let added = [];
   try {
-    const selected = await invoke('choose_documents', { multiple: ['merge', 'compress', 'organize'].includes(mode), allowImages: ['merge', 'organize'].includes(mode) });
-    if (!selected.length) { message('Selection cancelled.'); return; }
-    added = selected;
-    await acceptSelection(selected); message(`${selected.length} ${selected.length === 1 ? 'file added' : 'files added'}`);
-  } catch (error) { message(String(error), 'error'); } finally { busy = false; render(); }
+    const result = await invoke('choose_documents', { multiple: ['merge', 'compress', 'organize'].includes(mode), allowImages: ['merge', 'organize'].includes(mode) });
+    if (!result.documents.length && !result.rejected.length) { message('Selection cancelled.'); return; }
+    current().importErrors = result.rejected; $('import-errors').open = !result.documents.length;
+    if (result.documents.length) await acceptSelection(result.documents);
+    showImportResult(result);
+  } catch (error) {
+    try { await cleanRegistry(); } catch { /* Keep the original import error visible. */ }
+    message(String(error), 'error');
+  } finally { busy = false; render(); }
   promptNextLocked();
 }
 async function importDrop(paths, position) {
@@ -414,13 +444,15 @@ async function importDrop(paths, position) {
   const insertionIndex = mode === 'organize' ? organizeDropTarget(position).index : mode === 'merge' && row ? Number(row.dataset.reorderIndex) : undefined;
   clearDropIndicator();
   busy = true; controls(); message(['merge', 'organize'].includes(mode) ? 'Adding files...' : 'Adding PDFs...');
-  let added = [];
   try {
-    const selected = await invoke('import_dropped_documents', { paths, allowImages: ['merge', 'organize'].includes(mode) });
-    added = selected;
-    await acceptSelection(selected, insertionIndex);
-    message(`${selected.length} ${selected.length === 1 ? 'file added' : 'files added'}`);
-  } catch (error) { message(String(error), 'error'); } finally { busy = false; render(); }
+    const result = await invoke('import_dropped_documents', { paths, allowImages: ['merge', 'organize'].includes(mode) });
+    current().importErrors = result.rejected; $('import-errors').open = !result.documents.length;
+    if (result.documents.length) await acceptSelection(result.documents, insertionIndex);
+    showImportResult(result);
+  } catch (error) {
+    try { await cleanRegistry(); } catch { /* Keep the original import error visible. */ }
+    message(String(error), 'error');
+  } finally { busy = false; render(); }
   promptNextLocked();
 }
 const dropIndicator = document.createElement('div');
@@ -522,7 +554,7 @@ async function save() {
   controls(); message(mode === 'split' || (mode === 'compress' && view.documents.length > 1) ? 'Select output folder' : 'Select save location');
   try {
     const splitRanges = mode === 'split' ? splitPlanFor(view).map(pageList).join(';') : view.ranges;
-    const result = await invoke('process_documents', { request: { jobId, operation: mode, ids: outputDocuments(view).map((doc) => doc.id), compression: view.compression, previewId: view.compressionPreview?.id ?? null, splitMode: mode === 'split' ? 'ranges' : 'every_page', pagesPerFile: Number(view.groupSize), ranges: splitRanges, pages: view.pages.map((page) => ({ documentId: page.documentId || '', page: page.page, rotation: page.rotation })), targetBytes: mode === 'compress' ? targetBytes(view) : null, outputNames: mode === 'split' ? splitOutputNames(view) : [], flattenForms: view.flattenForms, acknowledgeChanges: view.acknowledgeChanges }, onProgress });
+    const result = await invoke('process_documents', { request: { jobId, operation: mode, ids: outputDocuments(view).map((doc) => doc.id), compression: view.compression, previewId: view.compressionPreview?.id ?? null, splitMode: mode === 'split' ? (view.splitMode === 'file_size' ? 'file_size' : 'ranges') : 'every_page', pagesPerFile: Number(view.groupSize), ranges: splitRanges, pages: view.pages.map((page) => ({ documentId: page.documentId || '', page: page.page, rotation: page.rotation })), targetBytes: mode === 'compress' ? targetBytes(view) : null, maxOutputBytes: mode === 'split' && view.splitMode === 'file_size' ? splitSizeBytes(view) : null, outputNames: mode === 'split' ? splitOutputNames(view) : [], flattenForms: view.flattenForms, acknowledgeChanges: view.acknowledgeChanges }, onProgress });
     if (!result) { message('Save cancelled.'); return; } view.result = result;
     let text = activeMode !== 'split' && result.files === 1 ? `Saved ${result.name}. ${bytes(result.outputBytes)}.` : `Saved ${result.files} PDFs in ${result.name}.`;
     if (activeMode === 'compress') text += result.outputBytes < result.inputBytes ? ` ${Math.round((1 - result.outputBytes / result.inputBytes) * 100)}% smaller.` : result.recovered ? ' Saved a repaired copy.' : ' Already optimized. Saved an unchanged copy.';
@@ -659,7 +691,7 @@ function setMode(next) {
   document.title = tool.heading; invoke('set_view_title', { tool: mode }).catch(() => {}); $('heading').textContent = tool.heading; $('save-label').textContent = tool.action;
   $('choose-label').textContent = ['merge', 'organize'].includes(mode) ? 'Choose files' : mode === 'compress' ? 'Choose PDFs' : 'Choose a PDF';
   $('list-label').textContent = ['merge', 'compress', 'organize'].includes(mode) ? 'Documents' : 'Document';
-  $('split-mode').value = current().splitMode; $('group-size').value = current().groupSize; $('split-ranges').value = current().ranges; $('split-cuts').value = current().splitCuts; $('split-separate').checked = current().splitSeparate; $('split-combine').checked = current().splitCombine;
+  $('split-size').value = current().splitSize; $('split-mode').value = current().splitMode; $('group-size').value = current().groupSize; $('split-ranges').value = current().ranges; $('split-cuts').value = current().splitCuts; $('split-separate').checked = current().splitSeparate; $('split-combine').checked = current().splitCombine;
   $('target-size').value = current().targetSize;
   for (const input of document.querySelectorAll('input[name="compression"]')) input.checked = input.value === current().compression;
   for (const button of document.querySelectorAll('.tool')) { button.classList.toggle('active', button.dataset.mode === mode); button.setAttribute('aria-pressed', String(button.dataset.mode === mode)); }
@@ -668,7 +700,7 @@ function setMode(next) {
 for (const button of document.querySelectorAll('.tool')) button.addEventListener('click', () => setMode(button.dataset.mode));
 $('add').addEventListener('click', choose); $('choose').addEventListener('click', choose); $('save').addEventListener('click', save);
 $('clear').addEventListener('click', async () => {
-  if (busy) return; busy = true; invalidateCompression(); current().documents = []; current().pages = []; current().history = []; current().selected.clear(); current().result = null; resetEdits(current()); render();
+  if (busy) return; busy = true; invalidateCompression(); current().importErrors = []; current().documents = []; current().pages = []; current().history = []; current().selected.clear(); current().result = null; resetEdits(current()); render();
   try { await cleanRegistry(); message('Documents cleared.'); }
   catch (error) { message(String(error), 'error'); }
   finally { busy = false; controls(); }
@@ -766,6 +798,7 @@ $('flatten-forms').addEventListener('change', () => { current().flattenForms = $
 $('acknowledge-changes').addEventListener('change', () => { invalidateCompression(); current().acknowledgeChanges = $('acknowledge-changes').checked; current().result = null; render(); });
 $('split-mode').addEventListener('change', () => { current().splitMode = $('split-mode').value; current().result = null; lastSelected = null; render(); });
 $('group-size').addEventListener('input', () => { current().groupSize = $('group-size').value; current().result = null; splitSummary(); });
+$('split-size').addEventListener('input', () => { current().splitSize = $('split-size').value; current().result = null; splitSummary(); });
 $('split-ranges').addEventListener('input', () => { current().ranges = $('split-ranges').value; current().result = null; readSplitSelection(); splitSummary(); updateSelection(); });
 $('split-cuts').addEventListener('input', () => { current().splitCuts = $('split-cuts').value; current().result = null; readSplitSelection(); splitSummary(); updateSelection(); });
 $('split-separate').addEventListener('change', () => { current().splitSeparate = $('split-separate').checked; current().result = null; splitSummary(); });
