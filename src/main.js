@@ -58,7 +58,7 @@ function changesFor(view) {
   const blocked = any((features) => features.unsupportedForms) ? 'XFA forms are unsupported. Print or export a flattened copy, then add it again.'
     : pageOperation && any((features) => features.needsAppearances) ? 'A filled form must be saved in its original application before it can be changed.' : null;
   const flatten = !blocked && pageOperation && any((features) => features.forms);
-  const acknowledge = !blocked && (any((features) => features.signatures) || (pageOperation && any((features) => features.tags)));
+  const acknowledge = !blocked && any((features) => features.signatures);
   const notes = [];
   if (flatten) notes.push('Forms and annotations will become static.');
   if (any((features) => features.signatures)) notes.push('Signatures will be removed in the saved copy.');
@@ -1027,6 +1027,12 @@ $('app-update').addEventListener('click', async () => {
 $('release-notes').addEventListener('click', async () => {
   if (busy) return;
   try { await invoke('open_release_notes'); } catch (error) { message(String(error), 'error'); }
+});
+$('share-app').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText('https://github.com/el-jsn/offline-pdf-tools/releases/latest');
+    message('Download link copied.');
+  } catch { message('Could not copy the download link.', 'error'); }
 });
 $('retry-engine').addEventListener('click', checkEngine);
 $('cancel').addEventListener('click', async () => {

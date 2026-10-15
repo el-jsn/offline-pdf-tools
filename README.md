@@ -13,7 +13,8 @@ Documents are never uploaded.
 - Preview source PDFs in all four tools with page navigation and zoom. Organize previews follow the current page order and rotations.
 - Organize pages with group dragging, edge scrolling, keyboard selection, previews, rotation, duplication, removal, undo/redo, and moves to a specific position.
 - Split with thumbnail selection, named page groups, fixed groups, file size limits, every page, bookmarks, or page split points. Extract selected pages together or separately, combine custom groups, and preview output page lists.
-- Choose System, Light, or Dark appearance in the sidebar.
+- Choose System, Light, or Dark with the sidebar's appearance buttons. The running Mac app's Dock icon follows the selected appearance.
+- Copy the latest app download link from the sidebar's share button.
 - Add files through drag and drop or the file picker. Invalid or unsupported files are listed individually; valid files in the same batch remain available.
 - Keep an optional page preview beside the working list. Small windows show it over the workspace; full preview remains resizable.
 - Review split outputs by cover, page range, and editable filename. Merge can create document bookmarks from filenames, retaining existing bookmarks beneath them.
@@ -71,7 +72,7 @@ existing private update key; it is not committed to this repository. See
 - Digital signatures cannot be preserved through processing. A changed copy requires explicit acknowledgement; originals remain untouched.
 - Compare supports up to 500 pages, 1,000,000 extracted characters, and 200,000 tokens per PDF. It ignores whitespace and page breaks; it does not compare form-field values, images, annotations, formatting, or signatures. PDFs without readable text require OCR in another application. Pages with no extracted text are identified; their visual content is not verified. Large differences may be grouped into a single passage. PDF text extraction order can affect results.
 - Organize page checks support up to 500 pages. Blank detection uses a small rendered page and extracted text. Duplicate suggestions match the rendered preview dimensions, pixels, and extracted text, not the complete PDF objects. Small marks can be missed; all findings require visual review.
-- Page bookmarks are remapped to retained pages. Bookmarks without a resolvable page destination can be omitted. Merging retains attachments with distinct prefixes. Changed page layouts can discard named destinations, XMP metadata, and accessibility tags; accessibility changes require acknowledgement.
+- Page bookmarks are remapped to retained pages. Bookmarks without a resolvable page destination can be omitted. Merging retains attachments with distinct prefixes. Changed page layouts can discard named destinations, XMP metadata, and accessibility tags. Accessibility tag changes show a notice; digital signature removal requires confirmation.
 
 Input PDFs with recoverable compressed-stream warnings are repaired in a temporary
 working copy. The repaired copy must pass strict structure, stream, and page-count

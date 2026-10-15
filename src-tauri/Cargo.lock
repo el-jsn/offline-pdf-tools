@@ -2590,6 +2590,9 @@ version = "1.0.0"
 dependencies = [
  "flate2",
  "image",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "pdfium-render",
  "rfd",
  "serde",

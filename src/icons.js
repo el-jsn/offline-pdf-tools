@@ -1,4 +1,8 @@
 const shapes = {
+  system: '<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M5 19l1.5-1.5M17.5 6.5 19 5"/>',
+  moon: '<path d="M20.5 13A8.5 8.5 0 0 1 11 3.5 8.5 8.5 0 1 0 20.5 13Z"/>',
+  share: '<path d="M12 15V3m-4 4 4-4 4 4M8 10H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2h-3"/>',
   compare: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16M7 9h1M16 15h1"/>',
   duplicate: '<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>',
   redo: '<path d="M21 9H10a6 6 0 0 0 0 12M21 9l-5-5M21 9l-5 5"/>',

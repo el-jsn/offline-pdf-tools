@@ -1074,7 +1074,7 @@ async fn process_documents(
         let page_operation = request.operation != Operation::Compress;
         if page_operation && documents.iter().any(|doc| doc.features.forms) && !request.flatten_forms { return Err("Select Flatten forms before saving.".into()); }
         if page_operation && documents.iter().any(|doc| doc.features.needs_appearances) { return Err("Save the filled form in its original application before flattening.".into()); }
-        if documents.iter().any(|doc| doc.features.signatures || (page_operation && doc.features.tags)) && !request.acknowledge_changes { return Err("Review document changes before saving.".into()); }
+        if documents.iter().any(|doc| doc.features.signatures) && !request.acknowledge_changes { return Err("Confirm digital signature removal before saving.".into()); }
         let engine = engine(&app)?; check_version(&engine)?;
         let suffix = match request.operation { Operation::Merge => "merged", Operation::Compress => "compressed", Operation::Split => "split", Operation::Organize => "organized" };
         let filename = if request.operation == Operation::Merge { "merged.pdf".into() } else { format!("{}-{suffix}.pdf", documents[0].path.file_stem().unwrap_or_default().to_string_lossy()) };
@@ -1500,6 +1500,34 @@ async fn install_app_update(
     .map_err(|_| "Update installation failed.")?
 }
 
+#[tauri::command]
+fn set_app_icon_appearance(app: tauri::AppHandle, dark: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let bytes: &'static [u8] = if dark {
+            include_bytes!("../icons/icon-dark.png")
+        } else {
+            include_bytes!("../icons/icon.png")
+        };
+        app.run_on_main_thread(move || {
+            use objc2::{AllocAnyThread, MainThreadMarker};
+            use objc2_app_kit::{NSApplication, NSImage};
+            use objc2_foundation::NSData;
+            if let Some(main_thread) = MainThreadMarker::new() {
+                let data = NSData::with_bytes(bytes);
+                if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+                    let application = NSApplication::sharedApplication(main_thread);
+                    // AppKit requires application icon changes on its main thread.
+                    unsafe { application.setApplicationIconImage(Some(&image)); }
+                }
+            }
+        }).map_err(|_| "Cannot update the app icon.".to_owned())?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, dark);
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1535,6 +1563,7 @@ fn main() {
             reveal_result,
             import_result_documents,
             open_release_notes,
+            set_app_icon_appearance,
             set_view_title,
             check_app_update,
             install_app_update,
