@@ -20,13 +20,22 @@ Current installers are not Apple Developer ID signed or notarized, so macOS secu
 
 Balanced and Smaller use **compress-pdf 0.1.0**; Original quality uses **qpdf**. The lossy presets can change image and font appearance, and size targets are not guaranteed. [Compression details and processing limits](docs/usage.md#compression-engine).
 
-## Screenshots
+## Demo and screenshots
 
 ### Compress PDF
 
 This brochure went from 51.09 MB to 11.85 MB with Balanced. Results depend on the document and settings.
 
+![PDF Tools demo showing Balanced compression and the saved result](https://github.com/user-attachments/assets/3890a16d-8a80-4fd2-b0cf-6ba1b250e2b2)
+
+Idle sections trimmed; compression shown at 8x speed.
+
+<details>
+<summary>Compression result screenshot</summary>
+
 ![Compression result showing a 51.09 MB brochure reduced to 11.85 MB using Balanced](https://github.com/user-attachments/assets/621ecdf0-72d0-4342-b9f4-4ad60b673c7e)
+
+</details>
 
 <details>
 <summary>Organize pages</summary>
