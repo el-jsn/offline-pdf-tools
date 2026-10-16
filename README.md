@@ -3,21 +3,38 @@
 A desktop utility for merging, compressing, splitting, organizing, and comparing PDFs locally.
 Documents are never uploaded.
 
+## Compression engine
+
+**Balanced** and **Smaller** use the bundled **compress-pdf 0.1.0** engine to optimize images, embedded fonts, and PDF structure locally. **Original quality** uses qpdf for lossless structural compression.
+
+Balanced targets 150 DPI; Smaller targets 72 DPI and can convert images to RGB. Both are lossy presets: review the comparison before saving. An optional size target tries progressively lower image resolutions, but cannot guarantee a particular output size. See [Processing limits](#processing-limits) for preservation checks and limitations.
+
 ## Screenshots
+
+### Compress PDF
+
+Review the output size before saving, then compare the original and compressed document. This example reduces a 51.09 MB brochure to 11.85 MB (77% smaller); results depend on the document and settings.
+
+![Compression result showing a 51.09 MB brochure reduced to 11.85 MB using Balanced](https://github.com/user-attachments/assets/621ecdf0-72d0-4342-b9f4-4ad60b673c7e)
+
+<details>
+<summary>Compression in progress</summary>
+
+![PDF Tools processing a brochure locally with the Balanced compression setting](https://github.com/user-attachments/assets/2096082a-2bcd-4232-8f77-bf10de931c87)
+
+</details>
 
 ### Organize pages
 
-Select, rotate, duplicate, and reorder pages with a document preview alongside the workspace.
+Select, rotate, duplicate, and reorder pages before saving a new PDF.
 
-![PDF Tools page organizer with selected pages and a local document preview](https://github.com/user-attachments/assets/0ff5e045-2b43-49f2-bf6e-878d6cc67d2f)
+![Page organizer showing four sample pages with page 2 selected](https://github.com/user-attachments/assets/0f2ea8f5-08c2-4728-b2d6-759ec2362031)
 
 ### Split PDF
 
 Choose page ranges or select thumbnails to extract the pages you need.
 
-![PDF Tools split workflow with pages 1 and 2 selected for extraction](https://github.com/user-attachments/assets/484a6294-c0ac-43e3-b4cc-81ebb4706972)
-
-Screenshots use a fictional sample document.
+![Split PDF with pages 1 and 2 selected for extraction](https://github.com/user-attachments/assets/694f9e47-3a41-43ea-8e7c-4f68c94fa45c)
 
 ## Features
 
