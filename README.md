@@ -26,7 +26,7 @@ Balanced and Smaller use **compress-pdf 0.1.0**; Original quality uses **qpdf**.
 
 This brochure went from 51.09 MB to 11.85 MB with Balanced. Results depend on the document and settings.
 
-![PDF Tools demo showing Balanced compression and the saved result](https://github.com/user-attachments/assets/3890a16d-8a80-4fd2-b0cf-6ba1b250e2b2)
+https://github.com/user-attachments/assets/94898385-c426-4f0d-9022-b51c0063690c
 
 Idle sections trimmed; compression shown at 8x speed.
 
