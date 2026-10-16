@@ -3,6 +3,22 @@
 A desktop utility for merging, compressing, splitting, organizing, and comparing PDFs locally.
 Documents are never uploaded.
 
+## Screenshots
+
+### Organize pages
+
+Select, rotate, duplicate, and reorder pages with a document preview alongside the workspace.
+
+![PDF Tools page organizer with selected pages and a local document preview](https://github.com/user-attachments/assets/0ff5e045-2b43-49f2-bf6e-878d6cc67d2f)
+
+### Split PDF
+
+Choose page ranges or select thumbnails to extract the pages you need.
+
+![PDF Tools split workflow with pages 1 and 2 selected for extraction](https://github.com/user-attachments/assets/484a6294-c0ac-43e3-b4cc-81ebb4706972)
+
+Screenshots use a fictional sample document.
+
 ## Features
 
 - Merge PDFs and JPEG, PNG, or WebP images in the order you choose. Each image becomes one page, preserving its proportions and orientation, with transparency on white. Images are limited to 32 megapixels; animated images use their first frame. HEIC is not supported.
